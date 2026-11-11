@@ -90,6 +90,29 @@ took down; capsules; poles and toes; write-back with IK/FK ramps for FK limbs th
 * A plant sits at the geometric median of where the contact was, not the mean: with two holds in one
   contact the mean is a place the foot never was.
 
+### Do no harm
+
+The synthetic walks never showed this; a pose-to-pose take with a kick did, once the cleaned take was
+rendered next to the raw one. Everything fast looked like an error.
+
+* A hold is not a dropout. A dropout interrupts motion and ends with one catch-up step; a hold is
+  arrived at, and a pose that is left quickly keeps moving after its first step (`_frozen_runs`).
+* Being early or late on the way between two frames is timing. Only what leaves the way is a spike.
+* Unattended repair (`repair(unsure=False)`, used by the one-click run) rebuilds only spikes with a
+  leave-out margin of 10 or more (`sure_spikes`). On the real take the margins were bimodal: finger
+  and hand glitches above 100, frames inside fast moves between 4 and 7. The **Repair** button and
+  **Fix This Issue** still rebuild what they are pointed at.
+* A spike in the location does not rebuild the rotation, and the other way round (`spike_parts`).
+* The filter may not move a control further than *Max Change* (`limit_change`). Below half the limit
+  it is exactly the linear filter.
+* Frames with the IK / FK switch between 0 and 1 are written back as they were unless the solver
+  changes the switch there. A leg that is switched from FK to IK starts its IK toe control from the
+  toes as they were seen (`ORG-toe`), not from where the unused control was left.
+* The one-click run reports the largest change it made to hips, head, knees, feet, elbows and hands
+  (`body_joints`, `largest_change`). Keep that line honest: it is what tells a user to look.
+* Measure floor contact on the character mesh as well (`tests/real_take.py`). The sole model has
+  four points per foot; a toe that the model thought was fine was 5 cm in the floor.
+
 ## Tests
 
 ```
@@ -107,7 +130,8 @@ tests/run.sh "/c/Program Files/Blender Foundation/Blender 5.3/blender.exe" [test
 | `test_simplifier` | error bounds, residual layer, editing sparse keys |
 | `test_addon` | the registered add-on end to end: operators, one-click run, pin track layout and drag, save and reload, register twice |
 | `test_ui` | every panel drawn against a stand-in `UILayout` that checks icons, properties and operators; overlay code paths |
-| `test_robustness` | cases found on real takes: in-place cycles, pose-to-pose snaps, foot roll, floating takes |
+| `test_robustness` | cases found on real takes: in-place cycles, pose-to-pose snaps, foot roll, floating takes; do no harm (holds, landings, kicks, IK / FK blends, doubtful spikes, the filter limit) |
+| `real_take.py` | not part of `run.sh`: runs the installed extension on a .blend you name and renders raw against cleaned (see its docstring) |
 | `check_names.py` | plain Python: no name is used without being defined |
 
 The tests generate a Rigify human once and cache it in the temp directory. `check_names.py` exists

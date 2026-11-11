@@ -732,7 +732,9 @@ class MOCAP_OT_run_all(_MocapOperator):
         report = common.run_analyze(context, rig)
         before = report.joints
         if st.pipe_repair:
-            res = s1.repair(rig, report, flips=st.repair_flips, spikes=st.repair_spikes, frozen=st.repair_frozen)
+            # unattended: only what is beyond doubt. Doubtful spikes stay in the issue list.
+            res = s1.repair(rig, report, flips=st.repair_flips, spikes=st.repair_spikes, frozen=st.repair_frozen,
+                            unsure=False)
             steps.append(f"repair ({res['spike_frames'] + res['frozen_frames']} frames)")
         if st.pipe_filter:
             confidence = common.run_analyze(context, rig).confidence if st.filter_adaptive else None

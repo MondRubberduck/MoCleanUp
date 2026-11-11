@@ -17,7 +17,9 @@ To build the zip yourself: `blender -c extension build --source-dir . --output-d
 2. `Window > MoCap Cleanup` in the top bar. This opens the workspace: viewport on top, Dope Sheet with
    the pin tracks and the Graph Editor below, and the **MoCap** tab in every sidebar (`N`).
 3. Pick the **Source** (Optical / Inertial Suit / Video) and press **Clean Up Take**. That runs repair,
-   filter, contact detection and the solver in the right order and reports what is still flagged.
+   filter, contact detection and the solver in the right order. It reports what is still flagged and
+   the largest change it made to the body ("Largest change: Knee R 4.1 cm at frame 40"), so you know
+   where to look.
 4. Walk through what is left with `[` and `]`. Each issue has a **Fix This Issue** button.
 5. Adjust: drag pins in the Dope Sheet, add pins with **Pin Here**, change a setting. With
    *Live Update* on, the result follows.
@@ -29,8 +31,8 @@ back the whole take, a frame range, or only the selected bones.
 
 | Stage | What it finds or fixes | How |
 |---|---|---|
-| **1 Diagnose** | Rotation flips, tracking spikes, frozen frames (dropouts), jitter, over-extended limbs, knee and elbow pops, floor penetration, sliding feet | Fourth-difference outlier score against a local noise level, Hampel test and a leave-out prediction test (a fast move or a foot strike is not a spike). Repair rewrites flips continuously, bridges gaps with minimum-jerk curves and SQUAD, and fills long gaps from the other joints (low-rank completion). |
-| **2 Filter** | Jitter | Whittaker, Modified Sinc, zero-phase Butterworth, B-spline or 1 Euro. All are set by a cutoff in Hz; **Suggest Cutoff** runs a residual analysis. Rotations are filtered on SO(3), never per channel. *Only Where Needed* limits the filter to frames flagged as noisy. |
+| **1 Diagnose** | Rotation flips, tracking spikes, frozen frames (dropouts), jitter, over-extended limbs, knee and elbow pops, floor penetration, sliding feet | Fourth-difference outlier score against a local noise level, Hampel test and a leave-out prediction test (a fast move or a foot strike is not a spike). Repair rewrites flips continuously, bridges gaps with minimum-jerk curves and SQUAD, and fills long gaps from the other joints (low-rank completion). **Clean Up Take** rebuilds only spikes that are beyond doubt; a spike inside a fast, uneven move is listed with a question mark and left for you (**Fix This Issue** or **Repair** rebuilds it). |
+| **2 Filter** | Jitter | Whittaker, Modified Sinc, zero-phase Butterworth, B-spline or 1 Euro. All are set by a cutoff in Hz; **Suggest Cutoff** runs a residual analysis. Rotations are filtered on SO(3), never per channel. *Only Where Needed* limits the filter to frames flagged as noisy. *Max Change* (2 cm by default) is the most the filter may move a control: noise is small, so anything larger would be a punch, a landing or a snap being rounded off. |
 | **3 Drift** | Slow sliding of the whole body, invisible stairs, loops that do not close | Zero-velocity updates at planted feet, floor levelling per step, loop closure with matching pose and velocity. Meant for inertial suits and video capture. |
 | **4 Pins** | Sliding feet, hands that should hold on to something, limbs below the floor | Kinematic Pins (see below), automatic contact detection, floor clipping for soles, toes and wrists. |
 | **5 Body** | Knee and elbow pops, IK snapping at full stretch, pole flips, jumps that ignore gravity, hands inside the body | Soft IK with a shared reach limit, the pelvis gives way for planted legs, optional heel peel, pole targets re-aimed and de-spiked, ballistic flight arcs for the centre of mass, capsule push-out. |
@@ -100,8 +102,18 @@ curves; the pins stay.
 tests/run.sh "/path/to/blender"
 ```
 
-Ten headless test files (49 tests) on a generated Rigify human, plus a static name check. See
+Ten headless test files (59 tests) on a generated Rigify human, plus a static name check. See
 `HANDOFF.md` for the layout of the code and for what a GUI session is needed to verify.
+
+To see what the installed extension does to one of your own takes without opening Blender:
+
+```
+blender -b -y --python tests/real_take.py -- take.blend "Rig Name" render=out_dir
+```
+
+It never saves the file. It prints foot slide, floor penetration (of the rig and of the character
+mesh) and the largest change before and after, checks that Restore Raw is exact, and renders
+contact sheets with the raw take on top and the cleaned one below.
 
 ## License
 

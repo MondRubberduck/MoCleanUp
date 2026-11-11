@@ -586,6 +586,81 @@ def test_a_kick_is_not_a_pole_whip():
     assert off[30:32].min() > 0.15 and off[:24].max() < 0.01 and off[38:].max() < 0.01, off.round(3)
 
 
+def test_one_click_rebuilds_only_spikes_beyond_doubt():
+    T = 40
+    t = np.arange(T, dtype=float)
+    smooth = np.stack([0.01 * t, 0.05 * np.sin(t / 6.0), np.zeros(T)], axis=1)
+    mask = np.zeros(T, dtype=bool)
+    mask[20] = True
+    glitch = smooth.copy()
+    glitch[20] += (0.06, 0.0, 0.05)                                 # 8 cm out of a smooth path
+    assert s1.sure_spikes(glitch, mask, 0.0002)[20]
+    # the same 8 cm in the middle of a move whose frames are a few cm off any smooth curve themselves
+    rough = glitch.copy()
+    rough[16:25:2, 1] += 0.03
+    assert s1._unpredictable(rough, 20, 20, 0.0002) and not s1.sure_spikes(rough, mask, 0.0002)[20]
+    # the first frames of a take: too few neighbours to tell
+    edge = np.zeros(T, dtype=bool)
+    edge[1] = True
+    early = smooth.copy()
+    early[1] += (0.06, 0.0, 0.05)
+    assert s1._unpredictable(early, 1, 1, 0.0002) and not s1.sure_spikes(early, edge, 0.0002)[1]
+
+    rig, gt, st = ta.make_scene(n_frames=70)                        # a 7 cm glitch on hand_ik.L
+    f0, f1 = gt["f0"], gt["f1"]
+    report = s1.analyze(rig)
+    assert report.spike_sure["hand_ik.L"]["loc"].sum() >= 1
+    assert not any(s1.UNSURE_NOTE in i.message for i in report.issues if i.kind == "SPIKE")
+    before = action_io.read_bone_local_channels(rig, "hand_ik.L", f0, f1)["loc"]
+    # had it been doubtful: the unattended repair leaves it, the one that was asked for rebuilds it
+    report.spike_sure["hand_ik.L"]["loc"][:] = False
+    assert s1.repair(rig, report, unsure=False)["spike_frames"] == 0
+    assert np.array_equal(action_io.read_bone_local_channels(rig, "hand_ik.L", f0, f1)["loc"], before)
+    assert s1.repair(rig, report)["spike_frames"] >= 1
+    assert not np.array_equal(action_io.read_bone_local_channels(rig, "hand_ik.L", f0, f1)["loc"], before)
+
+
+def test_a_leg_switched_to_ik_takes_its_toes_along():
+    """An FK leg whose foot dips through the floor is switched to IK for the fix. The IK toe control
+    was not in use there: the toes have to start from what was seen, not from where it was left."""
+    from mocap_cleanup.core.math_quat import quat_axis_angle
+    rig = fresh_rig()
+    set_limb_props(rig, ik_stretch=0.0, pole_vector=True)
+    f0, T = 1, 60
+    ident = np.tile([1.0, 0.0, 0.0, 0.0], (T, 1))
+    x_axis = np.array([1.0, 0.0, 0.0])
+    action_io.write_bone_local_channels(rig, "torso", f0, loc=np.zeros((T, 3)), quat=ident)
+    for S in ("L", "R"):
+        action_io.write_bone_local_channels(rig, f"foot_ik.{S}", f0, loc=np.zeros((T, 3)), quat=ident)
+    action_io.write_bone_prop_curve(rig, "thigh_parent.L", "IK_FK", f0, np.ones(T))           # the left leg is in FK
+    action_io.write_bone_local_channels(rig, "toe_ik.L", f0, quat=quat_axis_angle(x_axis, np.full(T, 0.7)))   # left somewhere
+    bpy.context.scene.frame_start, bpy.context.scene.frame_end = f0, f0 + T - 1
+    bump = np.clip(1.0 - np.abs(np.arange(T) - 30) / 8.0, 0.0, 1.0)
+    bump = bump * bump * (3.0 - 2.0 * bump)
+    for sense in (1.0, -1.0):                                       # which way points the toes down depends on the bone roll
+        action_io.write_bone_local_channels(rig, "foot_fk.L", f0, quat=quat_axis_angle(x_axis, sense * 0.5 * bump))
+        rig.update_tag()
+        bpy.context.view_layer.update()
+        profile, smp = sample_rig(rig)
+        leg = profile.legs["L"]
+        tip0 = smp.point_w(leg.org_toe, leg.toe_tip_local)
+        if tip0[:, 2].min() < -0.03:
+            break
+    assert tip0[:, 2].min() < -0.03 and abs(tip0[0, 2]) < 0.002, (tip0[:, 2].min(), tip0[0, 2])
+
+    res = solver.solve(rig, [], solver.SolveSettings())
+    profile, out = sample_rig(rig)
+    tip1 = out.point_w(leg.org_toe, leg.toe_tip_local)
+    sole1 = sole_world(profile, out, "L")
+    switch = action_io.read_bone_prop_curve(rig, "thigh_parent.L", "IK_FK", f0, f0 + T - 1)
+    print(f"   FK foot pitched 29 deg into the floor: toe tip {tip0[:, 2].min() * 100:.1f} cm -> {tip1[:, 2].min() * 100:.2f} cm "
+          f"(at the deepest frame {tip1[30, 2] * 1000:.1f} mm), sole {sole1[..., 2].min() * 1000:.1f} mm | {res.summary()}")
+    assert switch[30] < 0.01 and switch[3] > 0.99 and switch[-3] > 0.99                 # IK for the fix only
+    assert tip1[:, 2].min() > -0.002 and sole1[..., 2].min() > -0.002                   # nothing is left in the floor
+    assert abs(tip1[30, 2]) < 0.004                                                     # and the toes lie on it, not in the air
+    assert np.abs(tip1[:10] - tip0[:10]).max() < 0.001 and np.abs(tip1[-10:] - tip0[-10:]).max() < 0.001
+
+
 def test_unexpected_errors_are_reported_not_swallowed():
     rig, gt, st = ta.make_scene(n_frames=70)
     original = operators.common.run_analyze
@@ -621,5 +696,6 @@ if __name__ == "__main__":
                test_holds_are_not_dropouts, test_a_landing_is_not_a_spike, test_bridges_of_dropouts_do_not_wander,
                test_the_filter_keeps_fast_moves, test_a_snappy_take_comes_out_as_it_went_in,
                test_repair_touches_only_what_is_broken, test_frames_between_ik_and_fk_are_left_alone,
-               test_a_kick_is_not_a_pole_whip,
+               test_a_kick_is_not_a_pole_whip, test_one_click_rebuilds_only_spikes_beyond_doubt,
+               test_a_leg_switched_to_ik_takes_its_toes_along,
                test_unexpected_errors_are_reported_not_swallowed])

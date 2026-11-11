@@ -1,0 +1,340 @@
+"""Run the INSTALLED extension on a real take, headless, and measure what it did.
+
+    blender -b -y --python tests/real_take.py -- <file.blend> <rig name> [options]
+
+    render=<dir>        contact sheets, raw on top and cleaned below (Workbench): feet close-up and whole body
+    body=<frame,...>    frames of the body sheet (default: four spread over the take)
+    feet=<frame,...>    frames of the feet sheet (default: around the deepest floor penetration)
+    save=<copy.blend>   save the cleaned take as a COPY (plus <copy.blend>.npz with raw and cleaned curves)
+    expect=<text>       fail unless the extension was loaded from a path that contains <text>
+
+The file is opened and changed in memory only, it is never saved in place. Do not pass
+``--factory-startup``: the extension has to be installed and is loaded from the Blender profile
+(use ``BLENDER_USER_RESOURCES`` to point at a clean one). Nothing is imported from this repository.
+
+Prints: issues before, the one-click result, foot slide / sole depth / knee acceleration before and
+after, the lowest point of the character MESH below the floor before and after (what is seen, not what
+the rig model says), key reduction and whether Restore Raw is exact. Ends with ``RESULT: ok``.
+"""
+import importlib
+import math
+import os
+import re
+import sys
+import time
+
+import bpy
+import numpy as np
+from mathutils import Vector
+
+PKG = "bl_ext.user_default.mocap_cleanup"
+args = sys.argv[sys.argv.index("--") + 1:]
+path, rig_name = args[0], args[1]
+opts = dict(a.split("=", 1) for a in args[2:])
+
+if PKG not in bpy.context.preferences.addons:
+    print("extension was not enabled in this profile; enabling:", bpy.ops.preferences.addon_enable(module=PKG))
+pkg = importlib.import_module(PKG)
+where = pkg.__file__.replace("\\", "/")
+print("blender", bpy.app.version_string, "| package:", where)
+if "expect" in opts:
+    assert opts["expect"] in where, f"the extension was expected under {opts['expect']!r}"
+action_io = importlib.import_module(PKG + ".core.action_io")
+sampler = importlib.import_module(PKG + ".core.sampler")
+ri = importlib.import_module(PKG + ".core.rig_inspector")
+s1 = importlib.import_module(PKG + ".stages.stage1_diagnostics")
+
+bpy.ops.wm.open_mainfile(filepath=path, load_ui=False)
+scene = bpy.context.scene
+rig = bpy.data.objects[rig_name]
+st = scene.mocap_cleanup
+st.rig = rig
+bpy.context.view_layer.objects.active = rig
+data = rig.mocap_cleanup
+f0, f1 = action_io.get_action_frame_range(rig)
+T = f1 - f0 + 1
+
+
+def curves():
+    return {f"{fc.data_path}|{fc.array_index}": action_io.sample_fcurve_range(fc, f0, f1) for fc in action_io.iter_fcurves(rig)}
+
+
+def sample():
+    profile = ri.inspect_rig(rig)
+    smp = sampler.sample_objects([(rig, ri.solver_bone_names(profile, rig.data.bones))], f0, f1)[rig.name]
+    return profile, smp
+
+
+def soles(profile, smp):
+    return {S: ri.sole_contacts(leg, smp.world_m(leg.org_end)) for S, leg in profile.legs.items()}
+
+
+def measure(profile, smp, pins, floor_z):
+    slides, depth, pop = [], 0.0, 0.0
+    for S, pts in soles(profile, smp).items():
+        depth = max(depth, float(floor_z - pts[..., 2].min()))
+        for p in pins:
+            if p.owner == f"leg.{S}" and p.mode == "FLOOR" and p.enabled:
+                seg = pts[max(p.lock_in - f0, 0): p.lock_out - f0 + 1]
+                if len(seg) >= 3:
+                    low = int(np.argmin(seg[..., 2].mean(axis=0)))
+                    slides.append(float(np.linalg.norm(seg[:, low, :2] - seg[:1, low, :2], axis=1).max()))
+        leg = profile.legs[S]
+        a = smp.head_w(leg.org_upper) - smp.head_w(leg.org_lower)
+        b = smp.head_w(leg.org_end) - smp.head_w(leg.org_lower)
+        ang = np.degrees(np.arccos(np.clip(np.einsum("ti,ti->t", a, b) / (np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1) + 1e-12), -1, 1)))
+        pop = max(pop, float(np.abs(np.diff(ang, 2)).max()))
+    u = profile.unit
+    return (max(slides) / u * 1000 if slides else 0.0), depth / u * 1000, pop, len(slides)
+
+
+# ---- rendering ------------------------------------------------------------------------------------------------------
+def mesh_lowest(meshes):
+    """Lowest world z of the deformed character meshes at every frame: ``(T,)``."""
+    out = np.full(T, np.inf)
+    cur = scene.frame_current
+    for i in range(T):
+        scene.frame_set(f0 + i)
+        dg = bpy.context.evaluated_depsgraph_get()
+        for ob in meshes:
+            ev = ob.evaluated_get(dg)
+            me = ev.to_mesh()
+            co = np.empty(len(me.vertices) * 3)
+            me.vertices.foreach_get("co", co)
+            M = np.array(ev.matrix_world)
+            out[i] = min(out[i], float((co.reshape(-1, 3) @ M[2, :3] + M[2, 3]).min()))
+            ev.to_mesh_clear()
+    scene.frame_set(cur)
+    return out
+
+
+def character_meshes():
+    out = []
+    for ob in scene.objects:
+        if ob.type == "MESH":
+            for m in ob.modifiers:
+                arm = m.object if m.type == "ARMATURE" else None
+                if arm is not None and (arm == rig or any(getattr(c, "target", None) == rig for pb in arm.pose.bones for c in pb.constraints)):
+                    out.append(ob)
+                    break
+    return out
+
+
+def checker_floor(center, z, size=6.0, cell=0.05):
+    n = int(size / cell)
+    xs = np.arange(n + 1) * cell - 0.5 * size
+    verts = [(float(x), float(y), 0.0) for y in xs for x in xs]
+    faces = [(j * (n + 1) + i, j * (n + 1) + i + 1, (j + 1) * (n + 1) + i + 1, (j + 1) * (n + 1) + i) for j in range(n) for i in range(n)]
+    me = bpy.data.meshes.new("mc_check_floor")
+    me.from_pydata(verts, [], faces)
+    col = me.color_attributes.new("Col", "FLOAT_COLOR", "CORNER")
+    shade = np.array([(0.10 if (i + j) % 2 else 0.26) for j in range(n) for i in range(n)], dtype=np.float32)
+    rgba = np.repeat(np.stack([shade, shade, shade * 1.1, np.ones_like(shade)], axis=1), 4, axis=0)
+    col.data.foreach_set("color", rgba.ravel())
+    ob = bpy.data.objects.new("mc_check_floor", me)
+    scene.collection.objects.link(ob)
+    ob.location = (float(center[0]), float(center[1]), float(z))
+    return ob
+
+
+def make_camera(name, ortho_scale):
+    cam = bpy.data.objects.new(name, bpy.data.cameras.new(name))
+    cam.data.type = "ORTHO"
+    cam.data.ortho_scale = ortho_scale
+    cam.data.clip_start, cam.data.clip_end = 0.1, 100.0
+    scene.collection.objects.link(cam)
+    return cam
+
+
+def aim(cam, target, direction, dist=10.0):
+    d = Vector(direction).normalized()
+    cam.location = Vector(target) + d * dist
+    cam.rotation_euler = (-d).to_track_quat("-Z", "Y").to_euler()
+
+
+def render(cam, frame, res, out):
+    scene.camera = cam
+    scene.render.resolution_x, scene.render.resolution_y = res
+    scene.render.resolution_percentage = 100
+    scene.frame_set(frame)
+    scene.render.filepath = out
+    bpy.ops.render.render(write_still=True)
+
+
+def load(pathname):
+    img = bpy.data.images.load(pathname)
+    w, h = img.size
+    buf = np.empty(w * h * 4, dtype=np.float32)
+    img.pixels.foreach_get(buf)
+    bpy.data.images.remove(img)
+    return buf.reshape(h, w, 4)
+
+
+def sheet(rows, out):
+    """``rows``: lists of tile paths, first row on top. A white line separates the rows."""
+    lines = []
+    for r in rows:
+        tiles = [load(p) for p in r]
+        lines.append(np.concatenate(tiles, axis=1))
+    sep = np.ones((4, lines[0].shape[1], 4), dtype=np.float32)
+    stack = []
+    for k, line in enumerate(reversed(lines)):              # image rows are stored bottom-up
+        if k:
+            stack.append(sep)
+        stack.append(line)
+    arr = np.concatenate(stack, axis=0)
+    img = bpy.data.images.new("mc_sheet", arr.shape[1], arr.shape[0], alpha=False)
+    img.pixels.foreach_set(arr.ravel())
+    img.filepath_raw = out
+    img.file_format = "PNG"
+    img.save()
+    bpy.data.images.remove(img)
+    print("  sheet", os.path.basename(out), arr.shape[1], "x", arr.shape[0])
+
+
+raw = curves()
+assert bpy.ops.mocap.analyze() == {"FINISHED"}
+kinds = {}
+for it in data.issues:
+    kinds[it.kind] = kinds.get(it.kind, 0) + 1
+print(f"rig {rig.name!r} frames {f0}-{f1} @ {scene.render.fps} fps, {len(raw)} curves | floor {st.floor_z:.3f} (auto {st.floor_auto})")
+print("  analyze:", data.analysis_summary)
+profile, smp0 = sample()
+unit = profile.unit
+skin = character_meshes()
+low0 = mesh_lowest(skin) if skin else None
+
+shots = None
+if "render" in opts:
+    out_dir = opts["render"]
+    os.makedirs(out_dir, exist_ok=True)
+    tag = rig.name.replace(".", "_")
+    meshes = character_meshes()
+    print("  character meshes:", [m.name for m in meshes])
+    for ob in scene.objects:
+        if ob.type in {"MESH", "CURVE", "SURFACE", "FONT", "META", "VOLUME", "POINTCLOUD", "CURVES"} and ob not in meshes:
+            ob.hide_render = True
+    for ob in meshes:
+        ob.hide_render = False
+    sl = soles(profile, smp0)
+    depth = {S: (st.floor_z - p[..., 2].min(axis=1)) for S, p in sl.items()}
+    S = max(depth, key=lambda k: depth[k].max())
+    other = "L" if S == "R" else "R"
+    worst = int(np.argmax(depth[S]))
+    leg = profile.legs[S]
+    ball = sl[S][:, 2:].mean(axis=1)
+    heel = sl[S][:, :2].mean(axis=1)
+    fwd = ball[worst] - heel[worst]
+    fwd[2] = 0.0
+    fwd /= max(np.linalg.norm(fwd), 1e-9)
+    side = ball[worst] - sl[other][worst, 2:].mean(axis=0)
+    side[2] = 0.0
+    side -= fwd * float(side @ fwd)
+    side = side / np.linalg.norm(side) if np.linalg.norm(side) > 1e-3 else np.array([fwd[1], -fwd[0], 0.0])
+    torso = smp0.head_w(profile.torso_ctrl)
+    floor = checker_floor(torso[:, :2].mean(axis=0), st.floor_z)
+    sh = scene.display.shading
+    scene.render.engine = "BLENDER_WORKBENCH"
+    sh.light, sh.color_type = "STUDIO", "VERTEX"
+    sh.show_cavity, sh.show_object_outline, sh.show_shadows = True, True, False
+    try:
+        scene.view_settings.view_transform = "Standard"
+        scene.render.image_settings.file_format = "PNG"
+        scene.display.render_aa = "8"
+        if scene.world is None:
+            scene.world = bpy.data.worlds.new("mc_world")
+        scene.world.color = (0.03, 0.03, 0.04)
+    except Exception as exc:
+        print("  (render setup detail skipped:", exc, ")")
+    feet_cam = make_camera("mc_feet_cam", 0.75 * unit)
+    look = fwd * 0.75 + side * 0.66
+    look = look / np.linalg.norm(look) * math.cos(math.radians(22.0))
+    body_cam = make_camera("mc_body_cam", 2.5 * unit)
+    feet_frames = [int(np.clip(worst + d, 0, T - 1)) + f0 for d in (-4, -2, 0, 2)]
+    if "feet" in opts:
+        feet_frames = [int(v) for v in opts["feet"].split(",")]
+    body_frames = [f0 + int(round(q * (T - 1))) for q in (0.12, 0.37, 0.62, 0.87)]
+    if "body" in opts:
+        body_frames = [int(v) for v in opts["body"].split(",")]
+    print(f"  close-up: foot {S}, deepest raw penetration {depth[S].max() / unit * 1000:.1f} mm at frame {worst + f0}; frames {feet_frames}; body frames {body_frames}")
+
+    def shoot(label):
+        files = {"feet": [], "body": []}
+        for f in feet_frames:
+            # same aim for raw and cleaned: where the raw foot is at this frame, at floor height
+            at = ball[f - f0]
+            aim(feet_cam, (at[0], at[1], st.floor_z + 0.10 * unit), (look[0], look[1], math.sin(math.radians(22.0))))
+            p = os.path.join(out_dir, f"{tag}_feet_{label}_{f:04d}.png")
+            render(feet_cam, f, (480, 360), p)
+            files["feet"].append(p)
+        for f in body_frames:
+            c = torso[f - f0]
+            body_dir = fwd * 0.8 + side * 0.6
+            aim(body_cam, (c[0], c[1], st.floor_z + 0.95 * unit), (body_dir[0], body_dir[1], 0.18))
+            p = os.path.join(out_dir, f"{tag}_body_{label}_{f:04d}.png")
+            render(body_cam, f, (400, 480), p)
+            files["body"].append(p)
+        return files
+
+    t = time.time()
+    shots = {"raw": shoot("raw")}
+    print(f"  rendered raw tiles in {time.time() - t:.1f}s")
+
+t = time.time()
+assert bpy.ops.mocap.run_all() == {"FINISHED"}
+print(f"  one click ({time.time() - t:.1f}s): {data.last_result}")
+profile, smp1 = sample()
+b, a = measure(profile, smp0, data.pins, st.floor_z), measure(profile, smp1, data.pins, st.floor_z)
+print(f"  {a[3]} plants | slide {b[0]:.1f} -> {a[0]:.2f} mm | below floor {b[1]:.1f} -> {a[1]:.2f} mm | knee accel {b[2]:.1f} -> {a[2]:.1f} deg/f^2")
+print("  pins:", [(p.owner, p.mode, p.lock_in, p.lock_out) for p in data.pins])
+cleaned = curves()
+m = re.search(r"Largest change: (.+?) ([0-9.]+) cm at frame (\d+)", data.last_result)
+if m:
+    name, frame = m.group(1), int(m.group(3))
+    j0, j1 = s1.body_joints(profile, smp0).get(name), s1.body_joints(profile, smp1).get(name)
+    i = frame - f0
+    if j0 is not None and 2 <= i < T - 2:
+        def flick(x):
+            """Distance of each frame from the middle of its two neighbours: large for one frame = a flick."""
+            return np.linalg.norm(x[i - 2 : i + 3] - 0.5 * (x[i - 3 : i + 2] + x[i - 1 : i + 4]), axis=1) / unit * 100
+        with np.printoptions(precision=1, suppress=True):
+            print(f"  largest change, {name} at frame {frame}: cm off the line between the neighbouring frames, frames {frame - 2}..{frame + 2}: "
+                  f"raw {flick(j0)} -> cleaned {flick(j1)}")
+if low0 is not None:
+    low1 = mesh_lowest(skin)
+    # The mesh has its own sole, a little below or above the sole points of the rig. Its floor is
+    # where it is while the rig says a foot rests on the floor.
+    rig_low = np.min([p[..., 2].min(axis=1) for p in soles(profile, smp0).values()], axis=0)
+    resting = np.abs(rig_low - st.floor_z) < 0.01 * unit
+    skin_floor = st.floor_z - (float(np.median((rig_low - low0)[resting])) if resting.sum() >= 3 else 0.0)
+    print(f"  floor: rig soles rest at {st.floor_z * 100:.1f} cm, the mesh at {skin_floor * 100:.1f} cm")
+    d0, d1 = (skin_floor - low0) / unit * 100, (skin_floor - low1) / unit * 100
+    print(f"  character mesh {[m.name for m in skin]}: lowest point below the floor {d0.max():.1f} cm (frame {int(np.argmax(d0)) + f0}) "
+          f"-> {d1.max():.2f} cm (frame {int(np.argmax(d1)) + f0}); frames deeper than 5 mm: {int((d0 > 0.5).sum())} -> {int((d1 > 0.5).sum())}")
+
+if shots is not None:
+    shots["clean"] = shoot("clean")
+    for kind in ("feet", "body"):
+        sheet([shots["raw"][kind], shots["clean"][kind]], os.path.join(out_dir, f"{tag}_{kind}_raw_top_cleaned_bottom.png"))
+    for files in shots.values():
+        for lst in files.values():
+            for p in lst:
+                os.remove(p)
+
+if "save" in opts:
+    bpy.ops.wm.save_as_mainfile(filepath=opts["save"], copy=True)
+    np.savez(opts["save"] + ".npz", f0=f0, f1=f1, **{"raw:" + k: v for k, v in raw.items()}, **{"clean:" + k: v for k, v in cleaned.items()})
+    print("  saved a COPY:", opts["save"], "| original still", bpy.data.filepath)
+
+keys0 = sum(len(fc.keyframe_points) for fc in action_io.iter_fcurves(rig))
+r = bpy.ops.mocap.simplify()
+keys1 = sum(len(fc.keyframe_points) for fc in action_io.iter_fcurves(rig))
+print(f"  reduce keys: {r} {keys0} -> {keys1} keys | {data.last_result}")
+if bpy.ops.mocap.merge_residual.poll():
+    print("  merge detail layer:", bpy.ops.mocap.merge_residual())
+assert bpy.ops.mocap.restore_raw() == {"FINISHED"}
+now = curves()
+worst_diff = max((float(np.abs(now[k] - v).max()) for k, v in raw.items() if k in now), default=0.0)
+print(f"  restore raw: max curve difference {worst_diff:.2e}, missing {len([k for k in raw if k not in now])}, extra {len([k for k in now if k not in raw])}")
+print("RESULT: ok" if worst_diff < 1e-6 else "RESULT: restore raw differs")
+sys.stdout.flush()

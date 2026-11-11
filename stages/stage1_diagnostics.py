@@ -83,6 +83,7 @@ class DiagnosticReport:
     confidence: dict[str, np.ndarray] = field(default_factory=dict)      # bone -> (T,) 1 = clean
     spike_masks: dict[str, np.ndarray] = field(default_factory=dict)     # bone -> (T,) frames to rebuild
     spike_parts: dict[str, dict[str, np.ndarray]] = field(default_factory=dict)   # bone -> {'loc' | 'quat': (T,)}
+    spike_sure: dict[str, dict[str, np.ndarray]] = field(default_factory=dict)    # ... the ones beyond doubt
     joints: dict[str, np.ndarray] = field(default_factory=dict)          # 'Hips', 'Knee L', ... -> world (T, 3)
     frozen_runs: list[tuple[int, int]] = field(default_factory=list)     # index runs, whole body
     frozen_bones: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
@@ -146,17 +147,47 @@ def rotation_tangent_curve(quat: np.ndarray) -> np.ndarray:
 
 
 def _unpredictable(x: np.ndarray, s: int, en: int, noise: float, reach: int = 4, ratio: float = 3.0) -> bool:
-    """Leave-out test for the frames ``s..en`` of ``x (T, D)``.
+    """Leave-out test for the frames ``s..en`` of ``x (T, D)`` (see ``_leave_out_margin``).
+
+    Too few neighbours to tell (the ends of a take) count as unpredictable.
+    """
+    margin = _leave_out_margin(x, s, en, noise, reach)
+    return bool(np.isnan(margin) or margin > ratio)
+
+
+SURE_SPIKE = 10.0
+UNSURE_NOTE = "? Could be a fast move: Clean Up Take leaves it alone, Fix This Issue rebuilds it"
+
+
+def sure_spikes(x: np.ndarray, mask: np.ndarray, noise: float, margin: float = SURE_SPIKE) -> np.ndarray:
+    """The frames of ``mask`` (spike runs) that are spikes beyond doubt.
+
+    A glitch in otherwise smooth data is hundreds of times further from its neighbours' curve than
+    they are themselves. A frame inside a fast, uneven move is a few times further: it could be the
+    move. Only the first kind is safe to rebuild without asking; so is nothing at the ends of a
+    take, where there are too few neighbours to tell.
+    """
+    out = np.zeros(len(mask), dtype=bool)
+    for s, en in find_runs(mask):
+        m = _leave_out_margin(x, s, en, noise)
+        if not np.isnan(m) and m >= margin:
+            out[s : en + 1] = True
+    return out
+
+
+def _leave_out_margin(x: np.ndarray, s: int, en: int, noise: float, reach: int = 4) -> float:
+    """How far the frames ``s..en`` of ``x (T, D)`` are from what their neighbours predict.
 
     A cubic is fitted to the ``reach`` frames on either side. A spike sits far from it compared to
     how well the cubic describes those neighbours; the peak of an overshoot, the apex of a fast
-    swing or a frame inside an abrupt move does not.
+    swing or a frame inside an abrupt move does not. Returns the ratio of the two (``nan`` with
+    fewer than two neighbours on a side).
     """
     T = len(x)
     left = np.arange(max(s - reach, 0), s)
     right = np.arange(en + 1, min(en + 1 + reach, T))
     if len(left) < 2 or len(right) < 2:
-        return True
+        return float("nan")
     idx = np.concatenate([left, right])
     mid = 0.5 * (s + en)
     deg = min(3, len(idx) - 2)
@@ -165,7 +196,7 @@ def _unpredictable(x: np.ndarray, s: int, en: int, noise: float, reach: int = 4,
     fit = float(np.sqrt(np.mean(np.sum((A @ coef - x[idx]) ** 2, axis=1))))
     run = np.arange(s, en + 1)
     dev = float(np.linalg.norm(np.vander((run - mid) / reach, deg + 1) @ coef - x[run], axis=1).max())
-    return dev > ratio * max(fit, noise)
+    return dev / max(fit, noise, 1e-300)
 
 
 def outlier_scores(x: np.ndarray, floor: float, spike_z: float = 6.5, max_spike_len: int = 4,
@@ -285,6 +316,7 @@ def analyze(rig, *, bone_names: list[str] | None = None, floor_z: float = 0.0, f
     for bone in animated:
         ch = chans[bone]
         spike_any = np.zeros(T, dtype=bool)
+        sure_any = np.zeros(T, dtype=bool)
         loc_rms = rot_rms = 0.0
         protect = protect_all
 
@@ -343,13 +375,20 @@ def analyze(rig, *, bone_names: list[str] | None = None, floor_z: float = 0.0, f
             z_all = np.maximum(z_all, z_sus)
             if spike.any():
                 spike_any |= spike
-                report.spike_parts.setdefault(bone, {})["loc" if key == "loc" else "quat"] = spike.copy()
+                sure = sure_spikes(x, spike, 0.5 * sigma)
+                sure_any |= sure
+                part = "loc" if key == "loc" else "quat"
+                report.spike_parts.setdefault(bone, {})[part] = spike.copy()
+                report.spike_sure.setdefault(bone, {})[part] = sure
                 amp = hampel_deviation(x, 3)
+                doubt = lambda s, e, ok=sure: "" if ok[s:e + 1].all() else UNSURE_NOTE
                 if key == "loc":
-                    msg = lambda s, e, a=amp: f"{bone}: location spike of {a[s:e + 1].max() * scale * 100:.1f} cm"
+                    msg = lambda s, e, a=amp: f"{bone}: location spike of {a[s:e + 1].max() * scale * 100:.1f} cm{doubt(s, e)}"
                 else:
-                    msg = lambda s, e, a=amp: f"{bone}: rotation spike of {np.degrees(a[s:e + 1].max()):.1f} deg"
-                add_runs(spike, "SPIKE", bone, lambda s, e, zz=z: 0.6 + 0.4 * min(1.0, zz[s:e + 1].max() / (4 * spike_z)), msg)
+                    msg = lambda s, e, a=amp: f"{bone}: rotation spike of {np.degrees(a[s:e + 1].max()):.1f} deg{doubt(s, e)}"
+                add_runs(spike, "SPIKE", bone,
+                         lambda s, e, zz=z, ok=sure: (0.6 + 0.4 * min(1.0, zz[s:e + 1].max() / (4 * spike_z))) * (1.0 if ok[s:e + 1].all() else 0.6),
+                         msg)
             burst = (z_sus >= jitter_z) & ~spike
             if burst.any():
                 label = "location" if key == "loc" else "rotation"
@@ -358,7 +397,7 @@ def analyze(rig, *, bone_names: list[str] | None = None, floor_z: float = 0.0, f
                          lambda s, e, zz=z_sus, lb=label: f"{bone}: {lb} noise {zz[s:e + 1].max():.1f}x above the clip level",
                          min_len=5, gap=2)
         conf = np.exp(-0.35 * np.maximum(z_all - 2.5, 0.0))
-        conf[spike_any] = 0.02
+        conf[sure_any] = 0.02                  # the filter ignores these frames; a doubtful spike stays data
         report.confidence[bone] = conf
         report.noise[bone] = (loc_rms, rot_rms)
         if spike_any.any():
@@ -833,8 +872,13 @@ def fill_range(rig, frame_start: int, frame_end: int, bone_names: list[str] | No
 
 
 def repair(rig, report: DiagnosticReport, *, flips: bool = True, spikes: bool = True, frozen: bool = True,
-           frame_start: int | None = None, frame_end: int | None = None, bone_names: list[str] | None = None) -> dict:
-    """Apply the structural repairs suggested by ``report`` (optionally limited to a range / bones)."""
+           frame_start: int | None = None, frame_end: int | None = None, bone_names: list[str] | None = None,
+           unsure: bool = True) -> dict:
+    """Apply the structural repairs suggested by ``report`` (optionally limited to a range / bones).
+
+    ``unsure=False``: rebuild only the spikes that are beyond doubt (``sure_spikes``) - for repairs
+    nobody looks at one by one.
+    """
     f0, f1 = action_io.get_action_frame_range(rig)
     T = f1 - f0 + 1
     result = {"flips": 0, "spike_frames": 0, "frozen_frames": 0}
@@ -866,9 +910,13 @@ def repair(rig, report: DiagnosticReport, *, flips: bool = True, spikes: bool = 
                 mm = m & window
                 if mm.any():
                     # only the channel that spiked is rebuilt: a location spike leaves the rotation alone
+                    done = np.zeros(T, dtype=bool)
                     for key, pm in (report.spike_parts.get(bone) or {"loc": m, "quat": m}).items():
+                        if not unsure:
+                            pm = pm & report.spike_sure.get(bone, {}).get(key, np.zeros(T, dtype=bool))
                         part(bone)[key] |= pm & window
-                    spike_total += int(mm.sum())
+                        done |= pm & window
+                    spike_total += int(done.sum())
     if frozen:
         animated = action_io.get_animated_bone_names(rig)
         for s, e in report.frozen_runs:

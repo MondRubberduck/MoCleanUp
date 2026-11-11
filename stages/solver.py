@@ -661,7 +661,15 @@ def solve(rig, pins: list[s4.KinematicPin], settings: SolveSettings | None = Non
         # toes
         if limb.kind == "leg" and st.clip_toes and st.use_floor and limb.toe_ctrl and limb.org_toe and smp.has(limb.org_toe):
             D_E, joint, tip, axis, up = toe_geometry(L)
-            C1 = D_E @ smp.world_m(limb.toe_ctrl)
+            W_toe_ctrl = smp.world_m(limb.toe_ctrl)
+            # Where the take is in FK the IK toe control is not what is seen: it sits wherever it was
+            # left. A leg that is switched to IK there has to start from the toes as they were seen.
+            taken_over = (L["ikfk"] > 1e-4) & L["switched"]
+            if taken_over.any():
+                rest = rig.data.bones
+                X_toe = np.linalg.inv(np.array(rest[limb.org_toe].matrix_local)) @ np.array(rest[limb.toe_ctrl].matrix_local)
+                W_toe_ctrl = np.where(taken_over[:, None, None], smp.world_m(limb.org_toe) @ X_toe, W_toe_ctrl)
+            C1 = D_E @ W_toe_ctrl
             gamma = toe_lift_angle(joint, tip, axis, floor, st.floor_cushion, up=up)
             # a planted foot that stands on its ball keeps its toes on the ground
             # (on its ball: not a heel strike, where the toes point up on purpose)
@@ -670,7 +678,7 @@ def solve(rig, pins: list[s4.KinematicPin], settings: SolveSettings | None = Non
             gamma = gamma + toe_rest_angle(joint, tip, axis, floor, L["planted"] * near, st.floor_cushion, up=up)
             # the IK toe control only acts in IK: follow the (possibly ramped) switch, no steps
             gamma = gamma * (1.0 - np.clip(L["ikfk_new"] if L["activate"] else L["ikfk"], 0.0, 1.0))
-            if np.any(np.abs(gamma) > 1e-5):
+            if np.any(np.abs(gamma) > 1e-5) or taken_over.any():
                 res.toe_frames += int(np.count_nonzero(np.abs(gamma) > np.radians(0.2)))
                 R = np.tile(np.eye(4), (T, 1, 1))
                 R[:, :3, :3] = quat_to_matrix(quat_axis_angle(axis, gamma))
