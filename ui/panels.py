@@ -1,0 +1,473 @@
+"""Sidebar panels (3D View, Graph Editor, Dope Sheet): one stage at a time."""
+
+from __future__ import annotations
+
+import textwrap
+
+import bpy
+from bpy.types import Panel, UIList
+
+from .. import props
+from ..core import action_io, raw_snapshot, runtime
+from ..stages import stage1_diagnostics as s1
+from ..stages import stage6_simplifier as s6
+from . import common
+
+ISSUE_ICONS = {
+    "FLIP": "FILE_REFRESH", "SPIKE": "ERROR", "JITTER": "RNDCURVE", "FROZEN": "FREEZE",
+    "HYPEREXT": "CON_KINEMATIC", "KNEE_POP": "CANCEL", "PENETRATION": "TRIA_DOWN_BAR", "SKATE": "TRACKING_FORWARDS",
+}
+ISSUE_NAMES = {
+    "FLIP": "Flip", "SPIKE": "Spike", "JITTER": "Jitter", "FROZEN": "Frozen", "HYPEREXT": "Over-extended",
+    "KNEE_POP": "Pop", "PENETRATION": "Below floor", "SKATE": "Slide",
+}
+MODE_ICONS = {"FLOOR": "IMPORT", "WORLD": "WORLD", "TARGET": "CON_CHILDOF"}
+
+
+def _wrapped(layout, context, text: str, icon: str = "NONE") -> None:
+    """A label that wraps to the width of the sidebar."""
+    region = getattr(context, "region", None)
+    scale = context.preferences.system.ui_scale or 1.0
+    chars = max(18, int((region.width if region else 300 * scale) / (6.4 * scale)) - 8)
+    col = layout.column(align=True)
+    col.scale_y = 0.8
+    for i, line in enumerate(textwrap.wrap(text, chars) or [""]):
+        col.label(text=line, icon=icon if i == 0 else "NONE")
+
+
+class MOCAP_UL_issues(UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        row = layout.row(align=True)
+        row.label(text="", icon=ISSUE_ICONS.get(item.kind, "DOT"))
+        frames = f"{item.frame_start}" if item.frame_start == item.frame_end else f"{item.frame_start}-{item.frame_end}"
+        sub = row.row()
+        sub.ui_units_x = 3.6
+        sub.label(text=frames)
+        # short enough for a narrow sidebar; the whole message is shown below the list
+        row.label(text=f"{ISSUE_NAMES.get(item.kind, item.kind.title())}  {item.bone}")
+
+    def filter_items(self, context, data, propname):
+        items = getattr(data, propname)
+        flt = [self.bitflag_filter_item] * len(items)
+        if self.filter_name:
+            needle = self.filter_name.lower()
+            flt = [self.bitflag_filter_item if (needle in it.message.lower() or needle in it.kind.lower()
+                                                or needle in ISSUE_NAMES.get(it.kind, "").lower()) else 0
+                   for it in items]
+        return flt, []
+
+
+class MOCAP_UL_pins(UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        row = layout.row(align=True)
+        row.prop(item, "enabled", text="")
+        row.label(text=props.OWNER_LABELS.get(item.owner, item.owner), icon=MODE_ICONS.get(item.mode, "PINNED"))
+        sub = row.row()
+        sub.alignment = "RIGHT"
+        tail = ""
+        if item.mode == "TARGET":
+            tail = "  > " + (item.target_object.name if item.target_object else "?")
+        sub.label(text=f"{item.lock_in}-{item.lock_out}{tail}", icon="AUTO" if item.auto else "NONE")
+
+
+def _header(layout, st, rig):
+    col = layout.column(align=True)
+    row = col.row(align=True)
+    row.prop(st, "rig", text="")
+    row.operator("mocap.use_active_rig", text="", icon="EYEDROPPER")
+    if rig is None:
+        col.label(text="Pick an animated control rig", icon="INFO")
+        return False
+    act = action_io.get_active_action(rig)
+    if act is None:
+        col.label(text=f"'{rig.name}' has no animation", icon="INFO")
+        return False
+    profile = common.profile_of(rig)
+    f0, f1 = action_io.get_action_frame_range(rig)
+    info = col.row()
+    info.label(text=f"{act.name}  [{f0}-{f1}]", icon="ACTION")
+    if not profile.is_supported:
+        box = layout.box()
+        box.label(text="No Rigify controls found:", icon="ERROR")
+        box.label(text="curve tools only (diagnose, filter, keys)")
+    row = layout.row(align=True)
+    row.prop(st, "preset", text="")
+    row.operator("mocap.apply_preset", text="", icon="CHECKMARK")
+    row = layout.row(align=True)
+    row.scale_y = 1.3
+    row.operator("mocap.run_all", icon="PLAY")
+    row.operator("mocap.workspace_setup", text="", icon="WORKSPACE")
+    return True
+
+
+def _floor_rows(col, st) -> None:
+    col.prop(st, "floor_object")
+    if st.floor_object is None:
+        col.prop(st, "floor_auto")
+        sub = col.column(align=True)
+        sub.enabled = not st.floor_auto
+        sub.prop(st, "floor_z")
+
+
+def _scope(layout, st):
+    row = layout.row(align=True)
+    row.prop(st, "range_mode", text="")
+    row.prop(st, "only_selected", text="", icon="RESTRICT_SELECT_OFF")
+
+
+def _draw_diagnose(layout, context, st, rig):
+    data = rig.mocap_cleanup
+    col = layout.column(align=True)
+    row = col.row(align=True)
+    row.scale_y = 1.2
+    row.operator("mocap.analyze", icon="VIEWZOOM")
+    row.operator("mocap.issue_jump", text="", icon="TRIA_LEFT").direction = -1
+    row.operator("mocap.issue_jump", text="", icon="TRIA_RIGHT").direction = 1
+    if data.analysis_summary:
+        box = layout.box()
+        sub = box.column(align=True)
+        sub.scale_y = 0.85
+        if data.analysis_stale:
+            sub.label(text="Out of date - analyze again", icon="TIME")
+        text = data.analysis_summary
+        for part in [p.strip() for p in text.split(",")]:
+            sub.label(text=part)
+        if data.suggested_cutoff > 0.0:
+            sub.label(text=f"Suggested filter cutoff: {data.suggested_cutoff:.1f} Hz")
+        if (data.has_floor_estimate and not st.floor_auto and st.floor_object is None
+                and abs(data.floor_estimate - st.floor_z) > 0.02 * common.profile_of(rig).unit):
+            row = box.row(align=True)
+            row.label(text=f"Feet rest at {data.floor_estimate:.3f}", icon="INFO")
+            row.operator("mocap.floor_from_feet", text="Use")
+    if len(data.issues):
+        layout.template_list("MOCAP_UL_issues", "", data, "issues", data, "active_issue", rows=6)
+        if 0 <= data.active_issue < len(data.issues):
+            issue = data.issues[data.active_issue]
+            fix = s1.ISSUE_FIX.get(issue.kind, "")
+            label = {"REPAIR": "Repair This", "FILTER": "Filter This", "SOLVE": "Solve (Floor / Knees)",
+                     "CONTACTS": "Plant This Foot"}.get(fix, "Fix")
+            _wrapped(layout, context, issue.message, ISSUE_ICONS.get(issue.kind, "DOT"))
+            layout.operator("mocap.issue_fix", text=label, icon="TOOL_SETTINGS")
+    box = layout.box()
+    box.label(text="Structural Repair", icon="MODIFIER")
+    row = box.row(align=True)
+    row.prop(st, "repair_flips", toggle=True)
+    row.prop(st, "repair_spikes", toggle=True)
+    row.prop(st, "repair_frozen", toggle=True)
+    _scope(box, st)
+    row = box.row(align=True)
+    row.operator("mocap.repair", icon="CHECKMARK")
+    row.operator("mocap.fill_gap", text="Rebuild Range", icon="IPO_BEZIER")
+    col = layout.column(align=True)
+    col.use_property_split = True
+    col.use_property_decorate = False
+    col.prop(st, "spike_sensitivity")
+    col.prop(st, "jitter_sensitivity")
+    col.prop(st, "hyperext_ratio")
+
+
+def _draw_filter(layout, context, st, rig):
+    data = rig.mocap_cleanup
+    col = layout.column()
+    col.use_property_split = True
+    col.use_property_decorate = False
+    col.prop(st, "filter_method")
+    row = col.row(align=True)
+    row.prop(st, "cutoff_hz", text="Cutoff (Hz)")
+    row.operator("mocap.estimate_cutoff", text="", icon="EYEDROPPER")
+    if st.filter_method == "ONE_EURO":
+        col.prop(st, "euro_beta")
+    col.prop(st, "filter_strength")
+    col.prop(st, "filter_adaptive")
+    row = layout.row(align=True)
+    row.prop(st, "filter_location", toggle=True)
+    row.prop(st, "filter_rotation", toggle=True)
+    _scope(layout, st)
+    row = layout.row()
+    row.scale_y = 1.3
+    row.operator("mocap.filter", icon="SMOOTHCURVE")
+    if st.filter_adaptive and (not data.analysis_summary or data.analysis_stale):
+        layout.label(text="Analysis is refreshed automatically", icon="INFO")
+    _restore_box(layout, st, rig)
+
+
+def _restore_box(layout, st, rig):
+    box = layout.box()
+    snap = raw_snapshot.get_raw_snapshot(rig)
+    box.label(text="Raw Take" + ("" if snap else " (untouched)"), icon="GHOST_ENABLED" if snap else "GHOST_DISABLED")
+    col = box.column(align=True)
+    col.enabled = snap is not None
+    row = col.row(align=True)
+    row.operator("mocap.restore_raw", icon="LOOP_BACK")
+    row.prop(st, "restore_blend", text="Falloff")
+    row = col.row(align=True)
+    row.operator("mocap.snapshot", text="Set Current as Raw").action = "REFRESH"
+    row.operator("mocap.snapshot", text="", icon="TRASH").action = "DELETE"
+
+
+def _draw_drift(layout, context, st, rig):
+    col = layout.column(align=True)
+    col.use_property_split = True
+    col.use_property_decorate = False
+    _floor_rows(col, st)
+    if not st.floor_auto and st.floor_object is None:
+        col.operator("mocap.floor_from_feet", text="Set from Feet Once", icon="TRIA_DOWN_BAR")
+    box = layout.box()
+    box.label(text="Drift (inertial suits, video)", icon="TRACKING")
+    col = box.column(align=True)
+    col.use_property_split = True
+    col.use_property_decorate = False
+    col.prop(st, "drift_smooth_hz", text="Bandwidth (Hz)")
+    col.prop(st, "drift_strength")
+    row = box.row(align=True)
+    row.operator("mocap.dedrift", icon="CON_LOCLIMIT")
+    row.operator("mocap.level_floor", icon="IPO_LINEAR")
+    box = layout.box()
+    box.label(text="Cycle", icon="FILE_REFRESH")
+    col = box.column(align=True)
+    col.use_property_split = True
+    col.use_property_decorate = False
+    col.prop(st, "loop_blend")
+    col.prop(st, "loop_keep_travel")
+    box.operator("mocap.close_loop", icon="FILE_REFRESH")
+
+
+def _solve_row(layout, st, rig):
+    data = rig.mocap_cleanup
+    row = layout.row(align=True)
+    row.scale_y = 1.4
+    row.operator("mocap.solve", icon="PLAY")
+    row.operator("mocap.clear_solve", text="", icon="X")
+    row.prop(st, "auto_solve", text="", icon="FILE_REFRESH")
+    if raw_snapshot.get_solve_base(rig) is not None:
+        res = runtime.SOLVE_RESULTS.get(rig.name)
+        if res is not None:
+            col = layout.column(align=True)
+            col.scale_y = 0.8
+            for part in res.summary().split(", "):
+                col.label(text=part.replace("Solved (", "").replace(")", ""))
+            for w in res.warnings[:3]:
+                col.label(text=w, icon="ERROR")
+
+
+def _draw_pins(layout, context, st, rig):
+    data = rig.mocap_cleanup
+    row = layout.row(align=True)
+    row.scale_y = 1.2
+    row.operator("mocap.detect_contacts", icon="VIEWZOOM")
+    sub = layout.row(align=True)
+    sub.label(text="Pin Here:")
+    for mode, _n, _d, icon, _v in props.MODE_ITEMS:
+        sub.operator("mocap.pin_add", text=_n, icon=icon).mode = mode
+    row = layout.row()
+    row.template_list("MOCAP_UL_pins", "", data, "pins", data, "active_pin", rows=5)
+    col = row.column(align=True)
+    col.operator("mocap.pin_remove", text="", icon="REMOVE")
+    col.separator()
+    col.operator("mocap.pin_clear", text="", icon="AUTO").auto_only = True
+    col.operator("mocap.pin_clear", text="", icon="TRASH").auto_only = False
+    if 0 <= data.active_pin < len(data.pins):
+        pin = data.pins[data.active_pin]
+        box = layout.box()
+        col = box.column(align=True)
+        col.use_property_split = True
+        col.use_property_decorate = False
+        col.prop(pin, "name", text="Name")
+        col.prop(pin, "owner")
+        col.prop(pin, "mode")
+        if pin.mode == "TARGET":
+            col.prop(pin, "target_object")
+            if pin.target_object is not None and pin.target_object.type == "ARMATURE":
+                col.prop_search(pin, "target_bone", pin.target_object.data, "bones", text="Bone")
+        row = box.row(align=True)
+        row.prop(pin, "lock_in")
+        row.operator("mocap.pin_edge", text="", icon="TRIA_LEFT_BAR").edge = "IN"
+        row.operator("mocap.pin_edge", text="", icon="TRIA_RIGHT_BAR").edge = "OUT"
+        row.prop(pin, "lock_out")
+        row = box.row(align=True)
+        row.prop(pin, "blend_in")
+        row.prop(pin, "blend_out")
+        row = box.row(align=True)
+        row.prop(pin, "lock_location", toggle=True)
+        row.prop(pin, "lock_rotation", slider=True)
+        if pin.mode != "FLOOR" or pin.use_reference:
+            row = box.row(align=True)
+            row.prop(pin, "use_reference", text="Pose of Frame")
+            sub = row.row(align=True)
+            sub.enabled = pin.use_reference
+            sub.prop(pin, "reference_frame", text="")
+            sub.operator("mocap.pin_edge", text="", icon="TIME").edge = "REF"
+        else:
+            box.prop(pin, "use_reference", text="Pose of Frame (automatic placement)")
+    box = layout.box()
+    box.label(text="Floor", icon="TRIA_DOWN_BAR")
+    col = box.column(align=True)
+    col.use_property_split = True
+    col.use_property_decorate = False
+    _floor_rows(col, st)
+    col.prop(st, "use_floor")
+    sub = col.column(align=True)
+    sub.enabled = st.use_floor
+    sub.prop(st, "clip_toes")
+    sub.prop(st, "clip_hands")
+    sub.prop(st, "floor_cushion", text="Cushion (s)")
+    sub.prop(st, "flat_tolerance")
+    _solve_row(layout, st, rig)
+    col = layout.column(align=True)
+    col.use_property_split = True
+    col.use_property_decorate = False
+    col.label(text="Detection")
+    col.prop(st, "contact_height")
+    col.prop(st, "contact_speed")
+    col.prop(st, "contact_min_time", text="Min Duration (s)")
+    col.prop(st, "contact_hands")
+    col.prop(st, "pin_blend_in")
+    col.prop(st, "pin_blend_out")
+    col.prop(st, "pin_length", text="New Pin Length")
+
+
+def _draw_physics(layout, context, st, rig):
+    box = layout.box()
+    box.prop(st, "use_knee_fix", icon="CON_KINEMATIC")
+    col = box.column(align=True)
+    col.enabled = st.use_knee_fix
+    col.use_property_split = True
+    col.use_property_decorate = False
+    col.prop(st, "max_extension")
+    col.prop(st, "softness")
+    col.prop(st, "fix_elbows")
+    col.prop(st, "use_pole_fix")
+    col.separator()
+    col.prop(st, "use_pelvis")
+    sub = col.column(align=True)
+    sub.enabled = st.use_pelvis
+    sub.prop(st, "pelvis_max_drop")
+    sub.prop(st, "pelvis_smooth", text="Smoothing (s)")
+    sub.prop(st, "pelvis_horizontal")
+    col.separator()
+    col.prop(st, "use_heel_peel")
+    sub = col.column(align=True)
+    sub.enabled = st.use_heel_peel
+    sub.prop(st, "heel_peel_max")
+    box = layout.box()
+    box.prop(st, "use_ballistic", icon="FORCE_FORCE")
+    col = box.column(align=True)
+    col.enabled = st.use_ballistic
+    col.use_property_split = True
+    col.use_property_decorate = False
+    col.prop(st, "ballistic_strength")
+    col.prop(st, "gravity_scale")
+    box = layout.box()
+    box.prop(st, "use_capsules", icon="MESH_CAPSULE")
+    col = box.column(align=True)
+    col.enabled = st.use_capsules
+    col.use_property_split = True
+    col.use_property_decorate = False
+    col.prop(st, "body_thickness")
+    col.prop(st, "show_capsules")
+    _solve_row(layout, st, rig)
+
+
+def _draw_simplify(layout, context, st, rig):
+    has = s6.has_residual(rig)
+    col = layout.column(align=True)
+    col.use_property_split = True
+    col.use_property_decorate = False
+    col.label(text="Tolerance")
+    col.prop(st, "simplify_tol_loc")
+    col.prop(st, "simplify_tol_rot", text="Rotation (deg)")
+    col.prop(st, "simplify_residual")
+    col.prop(st, "simplify_keep_contacts")
+    col.prop(st, "only_selected")
+    row = layout.row()
+    row.scale_y = 1.3
+    row.operator("mocap.simplify", icon="KEYFRAME")
+    if has:
+        box = layout.box()
+        on = s6.residual_enabled(rig)
+        box.label(text="Residual detail layer is " + ("on" if on else "off"), icon="NLA")
+        row = box.row(align=True)
+        row.operator("mocap.toggle_residual", text="Hide Detail" if on else "Show Detail",
+                     icon="HIDE_OFF" if on else "HIDE_ON")
+        row.operator("mocap.merge_residual", icon="NLA_PUSHDOWN")
+        box.label(text="Other stages need a merge first", icon="INFO")
+    _restore_box(layout, st, rig)
+
+
+STAGE_DRAW = {
+    "DIAGNOSE": _draw_diagnose, "FILTER": _draw_filter, "DRIFT": _draw_drift, "CONTACTS": _draw_pins,
+    "PHYSICS": _draw_physics, "SIMPLIFY": _draw_simplify,
+}
+
+
+class _MainPanel:
+    bl_label = "MoCap Cleanup"
+    bl_region_type = "UI"
+    bl_category = "MoCap"
+
+    def draw(self, context):
+        layout = self.layout
+        st = context.scene.mocap_cleanup
+        rig = common.get_rig(context)
+        if not _header(layout, st, rig):
+            return
+        tabs = layout.column(align=True)
+        for idents in (("DIAGNOSE", "FILTER", "DRIFT"), ("CONTACTS", "PHYSICS", "SIMPLIFY")):
+            row = tabs.row(align=True)
+            for ident in idents:
+                row.prop_enum(st, "stage", ident)
+        _wrapped(layout, context, st.bl_rna.properties["stage"].enum_items[st.stage].description)
+        needs_rigify = st.stage in {"DRIFT", "CONTACTS", "PHYSICS"}
+        body = layout.column()
+        if needs_rigify and not common.profile_of(rig).is_supported and st.stage != "DRIFT":
+            body.label(text="This stage needs Rigify IK controls", icon="ERROR")
+            return
+        STAGE_DRAW[st.stage](body, context, st, rig)
+        data = rig.mocap_cleanup
+        if data.last_result:
+            _wrapped(layout.box(), context, data.last_result)
+
+
+class _OverlayPanel:
+    bl_label = "Overlays"
+    bl_region_type = "UI"
+    bl_category = "MoCap"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        st = context.scene.mocap_cleanup
+        col = self.layout.column(align=True)
+        col.label(text="Graph Editor / Dope Sheet")
+        col.prop(st, "show_heatmap")
+        sub = col.row()
+        sub.enabled = st.show_heatmap
+        sub.prop(st, "marks_only_selected")
+        col.prop(st, "show_ghost")
+        col.prop(st, "show_pin_tracks")
+        sub = col.row()
+        sub.enabled = st.show_pin_tracks
+        sub.prop(st, "show_pin_tracks_graph")
+        col.separator()
+        col.label(text="3D Viewport")
+        col.prop(st, "show_hud")
+        sub = col.column(align=True)
+        sub.enabled = st.show_hud
+        sub.prop(st, "show_floor")
+        sub.prop(st, "show_com")
+        sub.prop(st, "show_capsules")
+        col.separator()
+        col.label(text="[ and ] jump between issues", icon="INFO")
+        col.label(text="Drag the pin bars in the Dope Sheet", icon="INFO")
+
+
+def _make_panels():
+    classes = []
+    for space, suffix in (("VIEW_3D", "view3d"), ("GRAPH_EDITOR", "graph"), ("DOPESHEET_EDITOR", "dopesheet")):
+        main = type(f"MOCAP_PT_main_{suffix}", (_MainPanel, Panel), {"bl_space_type": space, "bl_idname": f"MOCAP_PT_main_{suffix}"})
+        over = type(f"MOCAP_PT_overlays_{suffix}", (_OverlayPanel, Panel),
+                    {"bl_space_type": space, "bl_idname": f"MOCAP_PT_overlays_{suffix}"})
+        classes += [main, over]
+    return classes
+
+
+CLASSES = (MOCAP_UL_issues, MOCAP_UL_pins, *_make_panels())

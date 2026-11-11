@@ -1,0 +1,16 @@
+schema_version = "1.0.0"
+
+id = "mocap_cleanup"
+version = "1.0.0"
+name = "MoCap Cleanup Studio"
+tagline = "Staged motion capture cleanup for Rigify control rigs"
+maintainer = "Nils Gallist"
+type = "add-on"
+
+blender_version_min = "5.0.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+tags = ["Animation", "Rigging"]
+
+[build]
+paths_exclude_pattern = ["__pycache__/", "/.git/", "*.zip", "/tests/", "/docs/", "/dist/", "HANDOFF.md", ".gitignore", ".gitattributes"]
