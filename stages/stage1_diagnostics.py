@@ -34,6 +34,7 @@ from ..core.math_quat import (
     quat_log,
     quat_multiply,
     quat_normalize,
+    quat_slerp,
     quat_squad_bridge,
     quintic_blend_weight,
 )
@@ -81,6 +82,8 @@ class DiagnosticReport:
     issues: list[Issue] = field(default_factory=list)
     confidence: dict[str, np.ndarray] = field(default_factory=dict)      # bone -> (T,) 1 = clean
     spike_masks: dict[str, np.ndarray] = field(default_factory=dict)     # bone -> (T,) frames to rebuild
+    spike_parts: dict[str, dict[str, np.ndarray]] = field(default_factory=dict)   # bone -> {'loc' | 'quat': (T,)}
+    joints: dict[str, np.ndarray] = field(default_factory=dict)          # 'Hips', 'Knee L', ... -> world (T, 3)
     frozen_runs: list[tuple[int, int]] = field(default_factory=list)     # index runs, whole body
     frozen_bones: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
     flip_bones: list[str] = field(default_factory=list)
@@ -207,9 +210,14 @@ def outlier_scores(x: np.ndarray, floor: float, spike_z: float = 6.5, max_spike_
             continue
         a, b = max(s - 1, 0), min(en + 1, T - 1)
         if b - a >= 2:
-            u = ((np.arange(a + 1, b) - a) / float(b - a))[:, None]
-            excursion = np.linalg.norm(x[a + 1 : b] - ((1.0 - u) * x[a] + u * x[b]), axis=1).max()
-            if excursion < 0.75 * np.linalg.norm(x[b] - x[a]):
+            # How far do the frames leave the straight way from a to b? Being early or late on it
+            # is timing (a fast move, a landing), only what leaves the segment is an excursion.
+            chord = x[b] - x[a]
+            length2 = float(chord @ chord)
+            rel = x[a + 1 : b] - x[a]
+            along = np.clip(rel @ chord / length2, 0.0, 1.0) if length2 > 0.0 else np.zeros(len(rel))
+            excursion = np.linalg.norm(rel - along[:, None] * chord, axis=1).max()
+            if excursion < 0.75 * np.sqrt(length2):
                 continue
         if not _unpredictable(x, s, en, 0.5 * sigma):
             continue
@@ -283,8 +291,10 @@ def analyze(rig, *, bone_names: list[str] | None = None, floor_z: float = 0.0, f
         # single channel dropouts (sensor froze while the rest of the body kept moving)
         if ch["has_rot"]:
             step = quat_angle_between(ch["quat"][:-1], ch["quat"][1:])
+            # a sensor that drops out freezes the whole bone: a location that keeps moving means the rotation is held on purpose
+            still = (np.abs(np.diff(ch["loc"], axis=0)).max(axis=1) < 1e-6 * unit / scale) if ch["has_loc"] else None
             runs = [(s, e) for s, e in _frozen_runs(step, eps=1e-6, active=np.radians(0.4), min_len=2, max_len=45,
-                                                    jump_ratio=2.0) if not frozen_all[s : e + 1].all()]
+                                                    jump_ratio=2.0, still=still) if not frozen_all[s : e + 1].all()]
             if runs:
                 report.frozen_bones[bone] = runs
                 own = np.zeros(T, dtype=bool)
@@ -333,6 +343,7 @@ def analyze(rig, *, bone_names: list[str] | None = None, floor_z: float = 0.0, f
             z_all = np.maximum(z_all, z_sus)
             if spike.any():
                 spike_any |= spike
+                report.spike_parts.setdefault(bone, {})["loc" if key == "loc" else "quat"] = spike.copy()
                 amp = hampel_deviation(x, 3)
                 if key == "loc":
                     msg = lambda s, e, a=amp: f"{bone}: location spike of {a[s:e + 1].max() * scale * 100:.1f} cm"
@@ -380,11 +391,16 @@ def _dilate(mask: np.ndarray, radius: int) -> np.ndarray:
 
 
 def _frozen_runs(change: np.ndarray, eps: float, active: float, min_len: int, max_len: int,
-                 jump_ratio: float = 1.5) -> list[tuple[int, int]]:
+                 jump_ratio: float = 1.5, still: np.ndarray | None = None) -> list[tuple[int, int]]:
     """Runs of (near) zero frame-to-frame change that are dropouts. Returns frame-index runs to rebuild.
 
-    A dropout sits inside moving data and ends with a snap: the first step after it has to make up
-    for the frozen frames. A deliberate hold (a planted foot, a pose that eases in and out) does not.
+    A dropout sits inside moving data and ends with a snap: one step that makes up for the frozen
+    frames, after which the motion goes on at its own speed. A deliberate hold does not. A planted
+    foot or a pose that eases in and out has no snap; a pose that is held and then left quickly
+    (pose-to-pose animation, a punch) keeps moving fast after its first step. And a dropout
+    interrupts the motion, while a hold is something the motion arrives at: it has slowed down
+    to a fraction of its speed before it stops.
+    ``still`` (per step): the other channels of the same sensor did not change either.
     """
     n = len(change)
     out = []
@@ -392,14 +408,48 @@ def _frozen_runs(change: np.ndarray, eps: float, active: float, min_len: int, ma
         length = e - s + 1
         if length < min_len or length > max_len:
             continue
+        if still is not None and not still[s : e + 1].all():
+            continue
         before = change[max(0, s - 6) : s]
         after = change[e + 2 : e + 8]
         if len(before) == 0 or len(after) == 0 or e + 1 >= n:
             continue
-        if np.median(before) > active and np.median(after) > active and change[e + 1] > jump_ratio * np.median(after):
+        alone = change[e + 1] > jump_ratio * change[e + 2 : e + 4].max()
+        arrived = change[s - 1] < 0.25 * before.max()
+        if (alone and not arrived and np.median(before) > active and np.median(after) > active
+                and change[e + 1] > jump_ratio * np.median(after)):
             # change[t] = x[t + 1] - x[t]: frames s + 1 .. e + 1 repeat frame s
             out.append((s + 1, e + 1))
     return out
+
+
+def body_joints(profile, smp) -> dict[str, np.ndarray]:
+    """World positions ``(T, 3)`` of the joints that show what a pose looks like."""
+    out = {}
+    for label, bone in (("Hips", profile.torso_ctrl), ("Head", profile.head_bone)):
+        if bone and smp.has(bone):
+            out[label] = smp.head_w(bone)
+    for limb in profile.limbs():
+        mid, end = ("Knee", "Foot") if limb.kind == "leg" else ("Elbow", "Hand")
+        if smp.has(limb.org_lower):
+            out[f"{mid} {limb.side}"] = smp.head_w(limb.org_lower)
+        if smp.has(limb.org_end):
+            out[f"{end} {limb.side}"] = smp.head_w(limb.org_end)
+    return out
+
+
+def largest_change(before: dict[str, np.ndarray], after: dict[str, np.ndarray], f0: int = 0):
+    """``(joint, distance, frame)`` of the largest move between two ``body_joints`` results (``None``: nothing to compare)."""
+    best = None
+    for name, a in before.items():
+        b = after.get(name)
+        if b is None or b.shape != a.shape:
+            continue
+        d = np.linalg.norm(b - a, axis=1)
+        i = int(np.argmax(d))
+        if best is None or d[i] > best[1]:
+            best = (name, float(d[i]), f0 + i)
+    return best
 
 
 def _world_checks(rig, profile, report, f0, f1, fps, floor_z, floor_object, hyperext, pop_threshold, skate_tol,
@@ -408,6 +458,7 @@ def _world_checks(rig, profile, report, f0, f1, fps, floor_z, floor_object, hype
     unit = profile.unit
     T = f1 - f0 + 1
     smp = sampler.sample_objects([(rig, solver_bone_names(profile, rig.data.bones))], f0, f1)[rig.name]
+    report.joints = body_joints(profile, smp)
     depsgraph = bpy.context.evaluated_depsgraph_get()
     floor = s4.Floor(floor_z, floor_object, depsgraph)
 
@@ -585,44 +636,95 @@ def lowrank_complete(X: np.ndarray, missing: np.ndarray, energy: float = 0.97, m
     return Zr * sd + mu
 
 
-def reconstruct_channels(chans: dict[str, dict], masks: dict[str, np.ndarray], long_gap: int = 7,
-                         window: int = 300) -> dict[str, dict]:
-    """Rebuild masked frames. ``chans``: bone -> ``read_bone_local_channels`` dict; ``masks``: bone -> (T,) bool.
+def _channel_masks(mask) -> dict[str, np.ndarray]:
+    """``mask``: one ``(T,)`` array for the whole bone, or ``{'loc': ..., 'quat': ...}``."""
+    return mask if isinstance(mask, dict) else {"loc": mask, "quat": mask}
+
+
+def tame_bridges(x: np.ndarray, mask: np.ndarray, max_detour: float = 2.0, quaternion: bool = False) -> np.ndarray:
+    """Replace rebuilt gaps that wander by the straight way between their ends.
+
+    For gaps that were found as dropouts: a frozen run only counts as one when it ends with a jump,
+    so what was missed has a clear direction. A bridge that travels more than ``max_detour`` times
+    that way was steered by what happens around the gap (a fast move that stopped, another one
+    that starts), not by the gap.
+    """
+    x = np.array(x, dtype=np.float64, copy=True)
+    T = len(x)
+    for s, e in find_runs(mask):
+        a, b = s - 1, e + 1
+        if a < 0 or b > T - 1:
+            continue
+        seg = x[a : b + 1]
+        if quaternion:
+            way = float(quat_angle_between(seg[:-1], seg[1:]).sum())
+            direct = float(quat_angle_between(seg[0], seg[-1]))
+        else:
+            way = float(np.linalg.norm(np.diff(seg, axis=0), axis=1).sum())
+            direct = float(np.linalg.norm(seg[-1] - seg[0]))
+        if way <= max_detour * direct + 1e-12:
+            continue
+        n = e - s + 1
+        u = np.arange(1, n + 1) / (n + 1.0)
+        if quaternion:
+            x[s : e + 1] = quat_slerp(np.broadcast_to(x[a], (n, 4)), np.broadcast_to(x[b], (n, 4)), u)
+        else:
+            x[s : e + 1] = x[a] + u[:, None] * (x[b] - x[a])
+    return x
+
+
+def reconstruct_channels(chans: dict[str, dict], masks: dict, long_gap: int = 7, window: int = 300,
+                         guard: dict[str, np.ndarray] | None = None) -> dict[str, dict]:
+    """Rebuild masked frames. ``chans``: bone -> ``read_bone_local_channels`` dict; ``masks``: bone ->
+    ``(T,)`` bool for the whole bone, or ``{'loc': (T,), 'quat': (T,)}``. A channel without masked
+    frames is not touched (``None`` in the result).
 
     Returns ``bone -> {'loc': (T, 3) | None, 'quat': (T, 4) | None}`` for the bones in ``masks``.
     Every gap gets a Hermite / SQUAD bridge; gaps of ``long_gap`` frames or more are refined with
     low-rank inter-joint completion when at least a few other channels are intact over the gap.
+    ``guard``: bone -> frames whose bridges must not wander (see ``tame_bridges``).
     """
+    masks = {bone: _channel_masks(m) for bone, m in masks.items()}
     out: dict[str, dict] = {}
-    for bone, mask in masks.items():
+    for bone, m in masks.items():
         ch = chans[bone]
         out[bone] = {
-            "loc": bridge_vectors(ch["loc"], mask) if ch["has_loc"] else None,
-            "quat": bridge_quaternions(ch["quat"], mask) if ch["has_rot"] else None,
+            "loc": bridge_vectors(ch["loc"], m["loc"]) if ch["has_loc"] and m["loc"].any() else None,
+            "quat": bridge_quaternions(ch["quat"], m["quat"]) if ch["has_rot"] and m["quat"].any() else None,
         }
     if not masks:
         return out
-    T = len(next(iter(masks.values())))
+
+    def finish():
+        for bone, g in (guard or {}).items():
+            for key in ("loc", "quat"):
+                if bone in out and out[bone][key] is not None and (g & masks[bone][key]).any():
+                    out[bone][key] = tame_bridges(out[bone][key], g & masks[bone][key], quaternion=key == "quat")
+        return out
+
+    T = len(next(iter(masks.values()))["loc"])
     any_mask = np.zeros(T, dtype=bool)
     for m in masks.values():
-        any_mask |= m
+        any_mask |= m["loc"] | m["quat"]
     long_runs = [(s, e) for s, e in find_runs(any_mask) if e - s + 1 >= long_gap and s > 0 and e < T - 1]
     if not long_runs:
-        return out
+        return finish()
 
     # Feature matrix over all animated bones: locations + rotation vectors about the mean rotation
     cols, col_mask, owners = [], [], []
     refs = {}
+    nothing = {"loc": np.zeros(T, dtype=bool), "quat": np.zeros(T, dtype=bool)}
     for bone, ch in chans.items():
-        m = masks.get(bone, np.zeros(T, dtype=bool))
         cur = out.get(bone, {})
         if ch["has_loc"]:
+            m = masks.get(bone, nothing)["loc"]
             x = cur.get("loc") if cur.get("loc") is not None else ch["loc"]
             if np.ptp(x, axis=0).max() > 1e-7:
                 cols.append(x)
                 col_mask.append(np.repeat(m[:, None], 3, axis=1))
                 owners.append((bone, "loc"))
         if ch["has_rot"]:
+            m = masks.get(bone, nothing)["quat"]
             q = cur.get("quat") if cur.get("quat") is not None else quat_hemisphere_continuous(ch["quat"])[0]
             ref = quat_normalize(q[~m].mean(axis=0)) if (~m).any() else q[0]
             v = quat_log(quat_multiply(quat_conjugate(ref)[None, :], q))
@@ -632,7 +734,7 @@ def reconstruct_channels(chans: dict[str, dict], masks: dict[str, np.ndarray], l
                 col_mask.append(np.repeat(m[:, None], 3, axis=1))
                 owners.append((bone, "quat"))
     if len(cols) < 4:
-        return out
+        return finish()
     X = np.concatenate(cols, axis=1)
     M = np.concatenate(col_mask, axis=1)
 
@@ -658,13 +760,13 @@ def reconstruct_channels(chans: dict[str, dict], masks: dict[str, np.ndarray], l
 
     c = 0
     for bone, kind in owners:
-        if bone in out and masks[bone].any():
+        if bone in out and masks[bone][kind].any():
             if kind == "loc":
                 out[bone]["loc"] = X[:, c : c + 3].copy()
             else:
                 out[bone]["quat"] = quat_hemisphere_continuous(quat_multiply(refs[bone][None, :], quat_exp(X[:, c : c + 3])))[0]
         c += 3
-    return out
+    return finish()
 
 
 # ---------------------------------------------------------------------------
@@ -693,24 +795,27 @@ def fix_flips(rig, bone_names: list[str] | None = None) -> int:
     return fixed
 
 
-def fill_gaps(rig, masks: dict[str, np.ndarray]) -> int:
-    """Reconstruct the masked frames of the given bones. Returns the number of rebuilt bone-frames."""
-    masks = {b: m for b, m in masks.items() if m.any()}
+def fill_gaps(rig, masks: dict, guard: dict[str, np.ndarray] | None = None) -> int:
+    """Reconstruct the masked frames of the given bones (see ``reconstruct_channels`` for ``masks``
+    and ``guard``). Channels without masked frames keep their curves. Returns the number of rebuilt
+    bone-frames."""
+    masks = {b: _channel_masks(m) for b, m in masks.items()}
+    masks = {b: m for b, m in masks.items() if m["loc"].any() or m["quat"].any()}
     if not masks:
         return 0
     f0, f1 = action_io.get_action_frame_range(rig)
     T = f1 - f0 + 1
-    has_long = any(e - s + 1 >= 7 for m in masks.values() for s, e in find_runs(m))
+    has_long = any(e - s + 1 >= 7 for m in masks.values() for part in m.values() for s, e in find_runs(part))
     names = action_io.get_animated_bone_names(rig) if has_long else list(masks)
     chans = {b: action_io.read_bone_local_channels(rig, b, f0, f1) for b in names if b in rig.pose.bones}
-    masks = {b: m for b, m in masks.items() if b in chans and len(m) == T}
-    result = reconstruct_channels(chans, masks)
+    masks = {b: m for b, m in masks.items() if b in chans and len(m["loc"]) == T}
+    result = reconstruct_channels(chans, masks, guard=guard)
     count = 0
     for bone, res in result.items():
         if res["loc"] is None and res["quat"] is None:
             continue
         action_io.write_bone_local_channels(rig, bone, f0, loc=res["loc"], quat=res["quat"])
-        count += int(masks[bone].sum())
+        count += int((masks[bone]["loc"] | masks[bone]["quat"]).sum())
     return count
 
 
@@ -748,14 +853,21 @@ def repair(rig, report: DiagnosticReport, *, flips: bool = True, spikes: bool = 
         if names:
             result["flips"] = fix_flips(rig, names)
 
-    masks: dict[str, np.ndarray] = {}
+    masks: dict[str, dict[str, np.ndarray]] = {}
+    guard: dict[str, np.ndarray] = {}
+
+    def part(bone):
+        return masks.setdefault(bone, {"loc": np.zeros(T, dtype=bool), "quat": np.zeros(T, dtype=bool)})
+
     spike_total = frozen_total = 0
     if spikes:
         for bone, m in report.spike_masks.items():
             if (wanted is None or bone in wanted) and len(m) == T:
                 mm = m & window
                 if mm.any():
-                    masks[bone] = mm.copy()
+                    # only the channel that spiked is rebuilt: a location spike leaves the rotation alone
+                    for key, pm in (report.spike_parts.get(bone) or {"loc": m, "quat": m}).items():
+                        part(bone)[key] |= pm & window
                     spike_total += int(mm.sum())
     if frozen:
         animated = action_io.get_animated_bone_names(rig)
@@ -764,17 +876,20 @@ def repair(rig, report: DiagnosticReport, *, flips: bool = True, spikes: bool = 
                 continue
             for bone in animated:
                 if wanted is None or bone in wanted:
-                    masks.setdefault(bone, np.zeros(T, dtype=bool))[s : min(e, T - 1) + 1] = True
+                    for key in ("loc", "quat"):
+                        part(bone)[key][s : min(e, T - 1) + 1] = True
             frozen_total += e - s + 1
         for bone, runs in report.frozen_bones.items():
             if wanted is not None and bone not in wanted:
                 continue
             for s, e in runs:
                 if window[s : e + 1].any():
-                    masks.setdefault(bone, np.zeros(T, dtype=bool))[s : min(e, T - 1) + 1] = True
+                    for key in ("loc", "quat"):
+                        part(bone)[key][s : min(e, T - 1) + 1] = True
+                    guard.setdefault(bone, np.zeros(T, dtype=bool))[s : min(e, T - 1) + 1] = True
                     frozen_total += e - s + 1
     if masks:
-        fill_gaps(rig, masks)
+        fill_gaps(rig, masks, guard=guard)
     result["spike_frames"] = spike_total
     result["frozen_frames"] = frozen_total
     return result

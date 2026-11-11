@@ -327,6 +327,265 @@ def test_foot_roll_is_part_of_the_pose():
     assert not res.warnings, res.warnings
 
 
+# ---- do no harm: fast motion is motion ------------------------------------------------------------------------------
+# Found by rendering a cleaned take next to the raw one: a snappy take (30 fps poses played at 60 fps,
+# holds, kicks, landings) came out with a foot half a metre off, because everything fast looked like an error.
+
+def test_holds_are_not_dropouts():
+    rng = np.random.default_rng(2)
+    v = 1.0 + 0.1 * rng.standard_normal(60)                       # frame-to-frame change of a channel that moves
+    kw = dict(eps=1e-6, active=0.2, min_len=2, max_len=45, jump_ratio=2.0)
+    # a dropout: four frames repeat, one step makes up for them, the motion goes on
+    drop = v.copy()
+    drop[20:24] = 0.0
+    drop[24] = v[20:25].sum()
+    assert s1._frozen_runs(drop, **kw) == [(21, 24)], s1._frozen_runs(drop, **kw)
+    # ... but not if the location of the same control kept moving meanwhile: then the rotation is held on purpose
+    still = np.ones(60, dtype=bool)
+    still[21:23] = False
+    assert s1._frozen_runs(drop, still=still, **kw) == []
+    # pose to pose: a hold that is left with a move of several frames - the first step is not alone
+    hold = np.zeros(60)
+    for k in (6, 20, 34, 48):
+        hold[k : k + 4] = (0.9, 0.9, 0.45, 0.45)
+    assert s1._frozen_runs(hold, **kw) == []
+    # a pose that is reached with an ease-out, held, and left with a snap that eases out again
+    eased = np.zeros(60)
+    for k in (3, 20, 37, 54):
+        eased[k : k + 5] = (0.45, 0.30, 0.17, 0.06, 0.02)
+    assert s1._frozen_runs(eased, **kw) == [] and s1._frozen_runs(eased, **dict(kw, jump_ratio=1.4)) == []
+    # the foot of the take this comes from (degrees per frame): snaps in, holds for ten frames, snaps out
+    foot = np.radians([30.0, 35.0, 38.0, 40.8, 24.9, 20.6] + [0.0] * 10 + [55.1, 55.6, 3.4, 2.5, 1.9, 1.5, 1.2, 1.0])
+    assert s1._frozen_runs(foot, eps=1e-6, active=np.radians(0.4), min_len=2, max_len=45, jump_ratio=2.0) == []
+
+
+def _landing():
+    """Hips of a landing (m): 13 cm down within two frames, 6 cm sideways and back, then up again."""
+    x = [0.7] * 14 + [-0.1] + [-0.9] * 16
+    y = [0.9] * 12 + [3.7, 6.6, 4.2, 1.7, 1.4, 1.2, 1.0] + [0.9] * 12
+    z = list(75.3 - 0.06 * np.arange(12)[::-1]) + [68.8, 62.3, 62.6, 63.2, 64.1, 65.1, 66.1] + list(67.2 + 0.8 * np.arange(12))
+    return np.stack([x, y, z], axis=1) * 0.01
+
+
+def test_a_landing_is_not_a_spike():
+    hips = _landing()
+    spike, *_ = s1.outlier_scores(hips, 0.0004)
+    assert not spike.any(), np.flatnonzero(spike)
+    # something that does leave the way and comes back still is one
+    bad = hips.copy()
+    bad[20] += (0.15, 0.0, 0.0)
+    spike, *_ = s1.outlier_scores(bad, 0.0004)
+    assert spike[20] and spike.sum() <= 3, np.flatnonzero(spike)
+
+
+def test_bridges_of_dropouts_do_not_wander():
+    from mocap_cleanup.core.math_quat import quat_angle_between, quat_axis_angle, quat_multiply
+    T = 40
+    mask = np.zeros(T, dtype=bool)
+    mask[15:24] = True
+    bulge = np.zeros(T)
+    bulge[15:24] = np.sin(np.linspace(0.0, np.pi, 11)[1:-1])
+    x = np.zeros((T, 3))
+    x[:, 0] = np.linspace(0.0, 0.3, T)
+    wild = x.copy()
+    wild[:, 1] = 0.5 * bulge                                       # half a metre off the way
+    tamed = s1.tame_bridges(wild, mask)
+    assert np.abs(tamed[:, 1]).max() < 1e-12 and np.array_equal(tamed[~mask], wild[~mask])
+    assert np.allclose(np.diff(tamed[14:25, 0]), np.diff(tamed[14:25, 0])[0])
+    gentle = x.copy()
+    gentle[:, 1] = 0.02 * bulge                                    # an arc hardly longer than the direct way stays
+    assert np.array_equal(s1.tame_bridges(gentle, mask), gentle)
+    # rotations: 30 degrees about X across the gap, the bridge swings 60 degrees about Y in between
+    turn = quat_axis_angle(np.array([1.0, 0.0, 0.0]), np.linspace(0.0, 2.0, T))
+    q = quat_multiply(turn, quat_axis_angle(np.array([0.0, 1.0, 0.0]), np.radians(60.0) * bulge))
+    tamed = s1.tame_bridges(q, mask, quaternion=True)
+    assert quat_angle_between(tamed, turn).max() < 1e-6 and np.array_equal(tamed[~mask], q[~mask])
+
+
+def test_the_filter_keeps_fast_moves():
+    from mocap_cleanup.core.math_quat import quat_angle_between, quat_axis_angle
+    from mocap_cleanup.stages import stage2_filters as s2
+    rng = np.random.default_rng(5)
+    T = 126
+    poses = np.repeat(rng.normal(0.0, 0.12, (T // 18, 3)), 18, axis=0)          # hold 18 frames, jump to the next pose
+    noise = rng.normal(0.0, 0.002, (T, 3))
+    raw = poses + noise
+    smooth = s2.apply_vector_filter(raw, "WHITTAKER", 6.0, 30.0)
+    out = s2.limit_change(raw, smooth, 0.02)
+    lost = np.linalg.norm(smooth - raw, axis=1).max()
+    kept = np.linalg.norm(out - raw, axis=1).max()
+    inside = (np.arange(T) % 18 > 4) & (np.arange(T) % 18 < 13)                 # well inside the holds
+    left = np.sqrt(np.mean((out - poses)[inside] ** 2)) / np.sqrt(np.mean(noise[inside] ** 2))
+    print(f"   6 Hz low-pass moves a snapping control by up to {lost * 100:.1f} cm, limited: {kept * 100:.2f} cm; "
+          f"noise left inside the holds: {left * 100:.0f} %")
+    assert lost > 0.04 and kept <= 0.02 + 1e-12
+    assert left < 0.75 and np.array_equal(out[inside], smooth[inside])          # where it is noise, the filter works as before
+    assert np.array_equal(s2.limit_change(raw, smooth, 0.0), smooth)            # 0 = no limit
+    # rotations: 10 degrees asked for, 2 allowed; 0.2 degrees pass
+    ident = np.tile([1.0, 0.0, 0.0, 0.0], (4, 1))
+    far = quat_axis_angle(np.array([0.0, 0.0, 1.0]), np.radians([10.0, 10.0, 0.2, 0.0]))
+    got = np.degrees(quat_angle_between(ident, s2.limit_change(ident, far, np.radians(2.0), is_quaternion=True)))
+    assert np.allclose(got[:2], 2.0, atol=0.01) and abs(got[2] - 0.2) < 0.002 and got[3] < 1e-9, got
+
+
+def _key_pose_to_pose(rig, n_poses=6, hold=12, move=(0.45, 0.75, 0.92, 0.98), seed=4):
+    """Key a snappy take on torso, head and FK arms: every pose is held, then left for the next within four frames."""
+    from mocap_cleanup.core.math_quat import quat_axis_angle, quat_slerp
+    rng = np.random.default_rng(seed)
+    per = hold + len(move)
+    T = n_poses * per - len(move)
+    lo = np.minimum(np.arange(T) // per, n_poses - 1)
+    k = np.arange(T) % per
+    frac = np.where(k < hold, 0.0, np.array(list(move) + [0.0])[np.clip(k - hold, 0, len(move))])
+    hi = np.minimum(lo + 1, n_poses - 1)
+
+    def rotations(sigma_deg):
+        axes = rng.normal(size=(n_poses, 3))
+        axes /= np.linalg.norm(axes, axis=1, keepdims=True)
+        q = quat_axis_angle(axes, np.radians(rng.normal(0.0, sigma_deg, n_poses)))
+        return quat_slerp(q[lo], q[hi], frac)
+
+    f0 = 1
+    p = rng.normal(0.0, 0.04, (n_poses, 3)) * (1.0, 1.0, 0.5) + (0.0, 0.0, -0.07)
+    action_io.write_bone_local_channels(rig, "torso", f0, loc=p[lo] + frac[:, None] * (p[hi] - p[lo]), quat=rotations(6.0))
+    for name, sigma in (("head", 15.0), ("upper_arm_fk.L", 25.0), ("upper_arm_fk.R", 25.0), ("forearm_fk.L", 25.0), ("forearm_fk.R", 25.0)):
+        action_io.write_bone_local_channels(rig, name, f0, quat=rotations(sigma))
+    ident = np.tile([1.0, 0.0, 0.0, 0.0], (T, 1))
+    for S in ("L", "R"):
+        action_io.write_bone_local_channels(rig, f"foot_ik.{S}", f0, loc=np.zeros((T, 3)), quat=ident)
+    bpy.context.scene.frame_start, bpy.context.scene.frame_end = f0, f0 + T - 1
+    return f0, T, [i * per + hold // 2 for i in range(n_poses)]
+
+
+def test_a_snappy_take_comes_out_as_it_went_in():
+    ta.ensure_registered()
+    rig = fresh_rig()
+    set_limb_props(rig, ik_stretch=0.0, pole_vector=True, ik_fk_arms=1.0)
+    f0, T, mid = _key_pose_to_pose(rig)
+    bpy.context.view_layer.objects.active = rig
+    rig.select_set(True)
+    bpy.ops.object.mode_set(mode="POSE")
+    st = bpy.context.scene.mocap_cleanup
+    st.rig = rig
+    data = rig.mocap_cleanup
+    profile, raw = sample_rig(rig)
+    before = s1.body_joints(profile, raw)
+    assert bpy.ops.mocap.analyze() == {"FINISHED"}
+    found = {i.kind for i in data.issues}
+    assert not {"FROZEN", "SPIKE", "FLIP"} & found, data.analysis_summary        # holds and snaps are not errors
+    assert bpy.ops.mocap.run_all() == {"FINISHED"}
+    profile, out = sample_rig(rig)
+    after = s1.body_joints(profile, out)
+    name, dist, frame = s1.largest_change(before, after, f0)
+    held = max(float(np.linalg.norm(after[n][mid] - before[n][mid], axis=1).max()) for n in before)
+    print(f"   one click on a pose-to-pose take: {data.last_result}")
+    print(f"   largest change {name} {dist * 100:.1f} cm at frame {frame}; in the middle of the holds {held * 1000:.1f} mm")
+    assert dist < 0.07 * profile.unit, (name, dist, frame)                      # the snaps stay snaps
+    assert held < 0.008 * profile.unit, held                                    # the poses stay the poses
+    assert "Largest change: " + name in data.last_result, data.last_result      # and the user is told how much moved
+
+    # a heavy hand on the cutoff (3 Hz): Max Change keeps the snaps, without it they are rounded off
+    worst = {}
+    for limit in (0.02, 0.0):
+        assert bpy.ops.mocap.restore_raw() == {"FINISHED"}
+        st.cutoff_hz, st.filter_max_shift = 3.0, limit
+        assert bpy.ops.mocap.run_all() == {"FINISHED"}
+        profile, out = sample_rig(rig)
+        worst[limit] = s1.largest_change(before, s1.body_joints(profile, out), f0)
+    print(f"   3 Hz low-pass: {worst[0.02][0]} {worst[0.02][1] * 100:.1f} cm with Max Change 2 cm, "
+          f"{worst[0.0][0]} {worst[0.0][1] * 100:.1f} cm without")
+    assert worst[0.0][1] > 1.5 * worst[0.02][1] and worst[0.02][1] < 0.07 * profile.unit
+
+
+def test_repair_touches_only_what_is_broken():
+    from mocap_cleanup.core.math_quat import quat_axis_angle
+    rig, gt, st = ta.make_scene(n_frames=70)                       # has a 7 cm location spike on hand_ik.L
+    f0, f1, T = gt["f0"], gt["f1"], gt["T"]
+    wave = quat_axis_angle(np.array([0.3, 0.9, 0.1]) / np.linalg.norm([0.3, 0.9, 0.1]), 0.4 * np.sin(np.arange(T) / 9.0))
+    action_io.write_bone_local_channels(rig, "hand_ik.L", f0, quat=wave)
+
+    def keys(prop):
+        return {fc.array_index: np.array([k.co[1] for k in fc.keyframe_points]) for fc in action_io.iter_fcurves(rig)
+                if fc.data_path == f'pose.bones["hand_ik.L"].{prop}'}
+
+    rot0, loc0 = keys("rotation_quaternion"), keys("location")
+    assert len(rot0) == 4 and len(loc0) == 3
+    assert bpy.ops.mocap.analyze() == {"FINISHED"}
+    spikes = [i for i in rig.mocap_cleanup.issues if i.kind == "SPIKE" and i.bone == "hand_ik.L"]
+    assert len(spikes) == 1 and "location" in spikes[0].message, [(i.kind, i.message) for i in rig.mocap_cleanup.issues]
+    assert bpy.ops.mocap.repair() == {"FINISHED"}
+    rot1, loc1 = keys("rotation_quaternion"), keys("location")
+    assert all(np.array_equal(rot0[i], rot1[i]) for i in range(4))             # the rotation is not rebuilt with it
+    changed = np.flatnonzero(np.any([loc0[i] != loc1[i] for i in range(3)], axis=0))
+    assert 1 <= len(changed) <= 4 and 50 in changed, changed                   # and the location only where it spiked
+
+
+def test_frames_between_ik_and_fk_are_left_alone():
+    """An IK / FK switch that is keyed at 30 fps and played at 60 has frames at 0.5: half IK, half FK."""
+    from mocap_cleanup.core.math_quat import quat_axis_angle
+    rig = fresh_rig()
+    set_limb_props(rig, ik_stretch=0.0, pole_vector=True)
+    gt = synth_walk(rig, n_frames=60)
+    f0, f1, T = gt["f0"], gt["f1"], gt["T"]
+    blend = 30                                                     # index of the frame in between
+    switch = np.where(np.arange(T) < blend, 0.0, 1.0)
+    switch[blend] = 0.5
+    action_io.write_bone_prop_curve(rig, "thigh_parent.L", "IK_FK", f0, switch)
+    swing = quat_axis_angle(np.array([1.0, 0.0, 0.0]), np.full(T, -0.7))        # the FK leg is swung up, away from the IK foot
+    action_io.write_bone_local_channels(rig, "thigh_fk.L", f0, quat=swing)
+    # something for the solver to do on that leg, well before the switch: the IK foot dips 3 cm through the floor
+    a, b = gt["plants"]["L"][0]
+    foot = action_io.read_bone_local_channels(rig, "foot_ik.L", f0, f1)
+    loc = foot["loc"].copy()
+    loc[a - f0 + 2 : a - f0 + 9, 2] -= 0.03
+    action_io.write_bone_local_channels(rig, "foot_ik.L", f0, loc=loc)
+    rig.update_tag()
+    bpy.context.view_layer.update()
+    profile, smp = sample_rig(rig)
+    leg = profile.legs["L"]
+    ankle0, knee0 = smp.head_w(leg.org_end), smp.head_w(leg.org_lower)
+    ik0 = smp.head_w(leg.ik_ctrl)
+    gap = float(np.linalg.norm(ankle0[blend] - ik0[blend]))
+    assert gap > 0.05, gap                                                     # the blended foot really is somewhere else
+    assert sole_world(profile, smp, "L")[a - f0 + 2 : a - f0 + 9, :, 2].min() < -0.02
+
+    res = solver.solve(rig, [], solver.SolveSettings())
+    profile, out = sample_rig(rig)
+    moved = np.linalg.norm(out.head_w(leg.org_end) - ankle0, axis=1)
+    knee = np.linalg.norm(out.head_w(leg.org_lower) - knee0, axis=1)
+    print(f"   blended frame: foot {gap * 100:.1f} cm from its IK control; after the solve the foot moved {moved[blend] * 1000:.2f} mm, "
+          f"the knee {knee[blend] * 1000:.2f} mm | {res.summary()}")
+    assert res.floor_frames > 0 and sole_world(profile, out, "L")[..., 2].min() > -5e-4      # the dip is fixed
+    assert moved[blend] < 0.001 and knee[blend] < 0.001, (moved[blend], knee[blend])        # the blended frame is not touched
+    assert moved[blend + 1 :].max() < 0.001 and knee[blend + 1 :].max() < 0.001             # nor the FK frames
+    assert np.array_equal(action_io.read_bone_prop_curve(rig, "thigh_parent.L", "IK_FK", f0, f1), switch)
+
+
+def test_a_kick_is_not_a_pole_whip():
+    from mocap_cleanup.stages import stage5_kinematics_phys as s5
+    T, fps = 60, 60.0
+    root = np.zeros((T, 3))
+    end = np.tile([0.0, 0.0, -0.6], (T, 1))
+    # the knee direction swings 110 degrees around the leg within four frames and stays there (a kick)
+    psi = np.zeros(T)
+    psi[30:34] = np.cumsum(np.radians([17.0, 24.0, 51.0, 22.0]))
+    psi[34:] = psi[33]
+    psi += np.radians(1.5) * np.sin(np.arange(T) / 5.0)
+
+    def poles(angle):
+        d = np.stack([np.cos(angle), np.sin(angle), np.zeros(T)], axis=1)
+        return d, s5.retarget_pole(root, end, d, root, end, 0.5, 0.5, fps=fps, smooth_cutoff=6.0)[0]
+
+    d, pole = poles(psi)
+    assert np.abs(pole - (root + 0.5 * (end - root) + 0.5 * d)).max() < 1e-9          # exactly where it was
+    # a whip: the knee direction jumps 60 degrees for two frames and comes back
+    whip = np.radians(1.5) * np.sin(np.arange(T) / 5.0)
+    whip[30:32] += np.radians(60.0)
+    d, pole = poles(whip)
+    off = np.linalg.norm(pole - (root + 0.5 * (end - root) + 0.5 * d), axis=1)
+    assert off[30:32].min() > 0.15 and off[:24].max() < 0.01 and off[38:].max() < 0.01, off.round(3)
+
+
 def test_unexpected_errors_are_reported_not_swallowed():
     rig, gt, st = ta.make_scene(n_frames=70)
     original = operators.common.run_analyze
@@ -359,4 +618,8 @@ if __name__ == "__main__":
     run_tests([test_only_feet_that_hold_still_are_plants, test_fast_moves_are_not_spikes, test_toe_bend_is_stable,
                test_toes_of_a_planted_foot_rest_on_the_floor, test_a_foot_is_planted_where_it_stays,
                test_foot_roll_is_part_of_the_pose, test_floating_take_is_cleaned_without_setting_the_floor,
+               test_holds_are_not_dropouts, test_a_landing_is_not_a_spike, test_bridges_of_dropouts_do_not_wander,
+               test_the_filter_keeps_fast_moves, test_a_snappy_take_comes_out_as_it_went_in,
+               test_repair_touches_only_what_is_broken, test_frames_between_ik_and_fk_are_left_alone,
+               test_a_kick_is_not_a_pole_whip,
                test_unexpected_errors_are_reported_not_swallowed])

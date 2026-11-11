@@ -34,6 +34,8 @@ from ..core.dsp import (
 from ..core.math_quat import (
     blend_by_weight,
     blend_window_weights,
+    quat_angle_between,
+    quat_slerp,
     quat_conjugate,
     quat_exp,
     quat_hemisphere_continuous,
@@ -285,17 +287,42 @@ def scene_fps(scene=None) -> float:
     return float(scene.render.fps) / max(float(scene.render.fps_base), 1e-9)
 
 
+def limit_change(raw: np.ndarray, new: np.ndarray, limit: float, is_quaternion: bool = False) -> np.ndarray:
+    """Let ``new`` differ from ``raw`` by ``limit`` at most (metres, or radians for quaternions).
+
+    The nonlinear half of an epsilon filter (Harashima et al. 1982): noise is small, so a
+    difference of up to half the limit passes exactly as filtered; a larger one means the low-pass
+    is rounding off a real move - a punch, a landing, a pose that snaps - and saturates smoothly
+    (C2) towards ``limit``.
+    """
+    if limit <= 0.0:
+        return new
+    half = 0.5 * limit
+
+    def keep(d):
+        allowed = np.where(d <= half, d, half + half * np.tanh((d - half) / half))
+        return np.where(d > half, allowed / np.maximum(d, 1e-300), 1.0)
+
+    if is_quaternion:
+        k = keep(quat_angle_between(raw, new))
+        return np.where((k < 1.0)[..., None], quat_slerp(raw, new, k), new)
+    k = keep(np.linalg.norm(new - raw, axis=-1, keepdims=True))
+    return np.where(k < 1.0, raw + (new - raw) * k, new)
+
+
 def filter_action(rig, method: str = "WHITTAKER", cutoff_hz: float = 8.0, *, bone_names: list[str] | None = None,
                   frame_start: int | None = None, frame_end: int | None = None, blend_frames: int = 4,
                   filter_location: bool = True, filter_rotation: bool = True, strength: float = 1.0,
                   confidence: dict[str, np.ndarray] | None = None, adaptive: bool = False,
                   order: int = 2, sinc_degree: int = 4, butter_order: int = 4, euro_beta: float = 1.0,
-                  unit: float = 1.0) -> int:
+                  unit: float = 1.0, max_shift: float = 0.0) -> int:
     """Filter the active action of ``rig``. Returns the number of filtered bones.
 
     ``confidence``: per-bone per-frame confidence in [0, 1] from the diagnostics. With
     ``adaptive=True`` only low-confidence regions are filtered (the rest stays bit-exact); the
     Whittaker smoother additionally down-weights those frames so artifacts do not leak.
+    ``max_shift`` (metres for a 1.75 m character, 0 = no limit): no control is moved further than
+    this, or turned further than moves the end of a 60 cm limb that far (``limit_change``).
     """
     f0, f1 = action_io.get_action_frame_range(rig)
     T = f1 - f0 + 1
@@ -340,19 +367,25 @@ def filter_action(rig, method: str = "WHITTAKER", cutoff_hz: float = 8.0, *, bon
         return apply_vector_filter(y, method, cutoff_hz, fps, weights=weights, order=order, sinc_degree=sinc_degree,
                                    butter_order=butter_order, euro_beta=euro_beta, unit=unit)
 
+    obj_scale = float(np.mean(np.abs(rig.matrix_world.to_scale()))) or 1.0
+    loc_limit = max_shift * unit / obj_scale            # bone locations are in armature units
+    rot_limit = max_shift / 0.6
+
     new_loc: dict[str, np.ndarray] = {}
     if loc_bones:
         Y = np.concatenate([chans[b]["loc"] for b in loc_bones], axis=1)
         F = run(Y, loc_bones, 3)
         for i, b in enumerate(loc_bones):
-            new_loc[b] = blend_by_weight(chans[b]["loc"], F[:, 3 * i : 3 * i + 3], mask_of(b))
+            new_loc[b] = limit_change(chans[b]["loc"], blend_by_weight(chans[b]["loc"], F[:, 3 * i : 3 * i + 3], mask_of(b)),
+                                      loc_limit)
 
     new_quat: dict[str, np.ndarray] = {}
     if rot_bones:
         Q = np.stack([quat_hemisphere_continuous(chans[b]["quat"])[0] for b in rot_bones], axis=1)   # (T, B, 4)
         F = filter_quaternions_intrinsic(Q, lambda v: run(v, rot_bones, 3))
         for i, b in enumerate(rot_bones):
-            new_quat[b] = blend_by_weight(Q[:, i], F[:, i], mask_of(b), is_quaternion=True)
+            new_quat[b] = limit_change(Q[:, i], blend_by_weight(Q[:, i], F[:, i], mask_of(b), is_quaternion=True),
+                                       rot_limit, is_quaternion=True)
 
     for b in targets:
         if b in new_loc or b in new_quat:

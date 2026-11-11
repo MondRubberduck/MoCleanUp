@@ -178,6 +178,7 @@ def _draw_filter(layout, context, st, rig):
     if st.filter_method == "ONE_EURO":
         col.prop(st, "euro_beta")
     col.prop(st, "filter_strength")
+    col.prop(st, "filter_max_shift")
     col.prop(st, "filter_adaptive")
     row = layout.row(align=True)
     row.prop(st, "filter_location", toggle=True)

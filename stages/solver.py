@@ -334,12 +334,17 @@ def solve(rig, pins: list[s4.KinematicPin], settings: SolveSettings | None = Non
                     (np.linalg.norm(commanded - W_end[:, :3, 3], axis=1) > 1e-4 * unit)
             use_meas = ikmode & (ang > np.radians(0.5)) & ~short
             X = np.where(use_meas[:, None, None], X_meas, limb.x_rest[None])
-        E0 = np.where(ikmode[:, None, None], W_ik @ X, W_end)
+        # A switch between 0 and 1 blends the FK and the IK chain: the limb end is neither where the
+        # IK control asks for it nor a pure FK pose. What is seen is ``W_end``, and the IK control
+        # keeps its offset to it - a blended frame without corrections is written back as it was.
+        partial = (ikfk > 1e-4) & (ikfk < 1.0 - 1e-4)
+        X = np.where(partial[:, None, None], _rigid_inv(W_ik) @ W_end, X)
+        E0 = np.where((ikmode & ~partial)[:, None, None], W_ik @ X, W_end)
         follows_torso = (~ikmode) | (follow.get(limb.ik_ctrl, {}).get(torso) == "RIGID")
         pos0 = E0[:, :3, 3].copy()
         quat0 = quat_hemisphere_continuous(quat_from_matrix(E0))[0]
         limbs[limb.key] = dict(
-            limb=limb, W_ik=W_ik, W_end=W_end, ikfk=ikfk, ikmode=ikmode, X=X, E0=E0, follows=follows_torso,
+            limb=limb, W_ik=W_ik, W_end=W_end, ikfk=ikfk, ikmode=ikmode, partial=partial, X=X, E0=E0, follows=follows_torso,
             root0=root0, mid0=mid0, pos0=pos0, quat0=quat0,
             bend0=s5.limb_bend_direction(root0, mid0, W_end[:, :3, 3]),
             length=limb.max_reach,
@@ -542,7 +547,10 @@ def solve(rig, pins: list[s4.KinematicPin], settings: SolveSettings | None = Non
                 mask = np.maximum(mask, blend_window_weights(T, s, e, st.ik_switch_blend, st.ik_switch_blend))
             L["ikfk_new"] = L["ikfk"] * (1.0 - mask)
             res.ik_activated.append(limb.label)
-        L["ik_active"] = L["ikmode"] | ((L["ikfk_new"] < 0.999) if L["activate"] else False)
+        L["switched"] = (np.abs(L["ikfk_new"] - L["ikfk"]) > 1e-6) if L["activate"] else np.zeros(T, dtype=bool)
+        active = L["ikmode"] | ((L["ikfk_new"] < 0.999) if L["activate"] else False)
+        # blended frames keep their pole and their IK offset unless the switch itself is changed there
+        L["ik_active"] = active & ~(L["partial"] & ~L["switched"])
 
     # ---- write: torso ------------------------------------------------------------------------------------------------------
     def write_ctrl(name, world, parent_pose, loc=True, rot=True):
@@ -577,7 +585,9 @@ def solve(rig, pins: list[s4.KinematicPin], settings: SolveSettings | None = Non
             L["G_ik"] = None
             continue
         E1 = _compose(L["pos"], L["quat"], scale)
-        W_ik1 = E1 @ _rigid_inv(L["X"])
+        # where the solver takes over a blended frame, the IK control has to be on target
+        X_out = np.where((L["partial"] & L["switched"])[:, None, None], limb.x_rest[None], L["X"])
+        W_ik1 = E1 @ _rigid_inv(X_out)
         L["W_ik1"] = W_ik1
         L["G_ik"] = smp.to_pose_space(W_ik1) @ _rigid_inv(smp.pose_m(limb.ik_ctrl))
         rel = follow.get(limb.ik_ctrl, {}).get(torso, "NONE")

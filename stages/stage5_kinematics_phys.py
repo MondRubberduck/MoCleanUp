@@ -254,6 +254,15 @@ def retarget_pole(root0, end0, bend_dir0, root1, end1, along_frac, dist, *, fps:
         sigma = max(float(mad_sigma(acc)), 0.15 * min(1.0, 30.0 / max(fps, 1.0)) / spike_z)
         z = np.maximum(acc - np.median(acc), 0.0) / sigma
         conf = np.exp(-0.4 * np.maximum(z - spike_z, 0.0))
+        # A whip comes back. A knee that swings somewhere else quickly (a kick, a leg that snaps
+        # straight) is motion: the angle ends up where the swing took it.
+        for s, e in find_runs(conf < 0.9):
+            a, b = max(s - 2, 0), min(e + 2, T - 1)
+            lo, hi = min(psi[a], psi[b]), max(psi[a], psi[b])
+            seg = psi[a : b + 1]
+            excursion = max(float((lo - seg).max()), float((seg - hi).max()), 0.0)
+            if excursion < 0.75 * (hi - lo):
+                conf[s : e + 1] = 1.0
         if np.any(conf < 0.9):
             lam = whittaker_lambda_for_cutoff(smooth_cutoff, fps, 2)
             filt = whittaker_smooth(psi, lam, 2, weights=np.clip(conf, 0.02, 1.0))

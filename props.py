@@ -227,6 +227,11 @@ class MCSettings(PropertyGroup):
     filter_adaptive: BoolProperty(name="Only Where Needed", default=False,
                                   description="Filter only frames the diagnosis marked as noisy; everything else "
                                               "stays bit-exact (run Analyze first)")
+    filter_max_shift: FloatProperty(name="Max Change", default=0.02, min=0.0, max=0.5, unit="LENGTH", precision=3,
+                                    description="Protect fast motion: the filter moves no control further than this "
+                                                "(and turns none further than moves a hand or a foot that far). "
+                                                "Noise is small; a larger change would be the filter rounding off a "
+                                                "real move. 0 = no limit")
     filter_location: BoolProperty(name="Location", default=True)
     filter_rotation: BoolProperty(name="Rotation", default=True)
     euro_beta: FloatProperty(name="Speed Response", default=1.0, min=0.0, max=20.0,

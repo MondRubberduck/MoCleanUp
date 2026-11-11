@@ -82,12 +82,15 @@ class MOCAP_OT_use_active_rig(_MocapOperator):
 
 PRESETS = {
     "OPTICAL": dict(filter_method="MODIFIED_SINC", cutoff_hz=10.0, filter_adaptive=False, spike_sensitivity=6.5,
+                    filter_max_shift=0.015,
                     pipe_repair=True, pipe_filter=True, pipe_dedrift=False, pipe_level=False, pipe_contacts=True,
                     pipe_solve=True, use_ballistic=False, use_knee_fix=True, use_pelvis=True),
     "IMU": dict(filter_method="WHITTAKER", cutoff_hz=8.0, filter_adaptive=False, spike_sensitivity=8.0,
+                filter_max_shift=0.02,
                 pipe_repair=True, pipe_filter=True, pipe_dedrift=True, pipe_level=True, pipe_contacts=True,
                 pipe_solve=True, use_ballistic=False, use_knee_fix=True, use_pelvis=True, drift_smooth_hz=1.5),
     "VIDEO": dict(filter_method="WHITTAKER", cutoff_hz=5.0, filter_adaptive=False, spike_sensitivity=5.5,
+                  filter_max_shift=0.04,
                   pipe_repair=True, pipe_filter=True, pipe_dedrift=True, pipe_level=True, pipe_contacts=True,
                   pipe_solve=True, use_ballistic=True, use_knee_fix=True, use_pelvis=True, drift_smooth_hz=1.0),
 }
@@ -239,7 +242,8 @@ class MOCAP_OT_issue_fix(_MocapOperator):
         elif tool == "FILTER":
             resolve = common.begin_edit(rig)
             s2.filter_action(rig, st.filter_method, st.cutoff_hz, bone_names=bones, frame_start=a, frame_end=b,
-                             blend_frames=max(st.restore_blend, 3), euro_beta=st.euro_beta, unit=common.profile_of(rig).unit)
+                             blend_frames=max(st.restore_blend, 3), euro_beta=st.euro_beta, unit=common.profile_of(rig).unit,
+                             max_shift=st.filter_max_shift)
             common.end_edit(context, rig, resolve)
             msg = f"Filtered frames {a}-{b}" + (f" of {bone}" if bone else "")
         elif tool == "CONTACTS":
@@ -289,7 +293,8 @@ class MOCAP_OT_filter(_MocapOperator):
         n = s2.filter_action(rig, st.filter_method, st.cutoff_hz, bone_names=bones, frame_start=fs, frame_end=fe,
                              blend_frames=st.restore_blend, filter_location=st.filter_location,
                              filter_rotation=st.filter_rotation, strength=st.filter_strength, confidence=confidence,
-                             adaptive=st.filter_adaptive, euro_beta=st.euro_beta, unit=common.profile_of(rig).unit)
+                             adaptive=st.filter_adaptive, euro_beta=st.euro_beta, unit=common.profile_of(rig).unit,
+                             max_shift=st.filter_max_shift)
         common.end_edit(context, rig, resolve)
         label = st.bl_rna.properties["filter_method"].enum_items[st.filter_method].name
         return f"{label} filter at {st.cutoff_hz:.1f} Hz on {n} bones"
@@ -725,6 +730,7 @@ class MOCAP_OT_run_all(_MocapOperator):
         steps = []
         common.begin_edit(rig)
         report = common.run_analyze(context, rig)
+        before = report.joints
         if st.pipe_repair:
             res = s1.repair(rig, report, flips=st.repair_flips, spikes=st.repair_spikes, frozen=st.repair_frozen)
             steps.append(f"repair ({res['spike_frames'] + res['frozen_frames']} frames)")
@@ -732,7 +738,8 @@ class MOCAP_OT_run_all(_MocapOperator):
             confidence = common.run_analyze(context, rig).confidence if st.filter_adaptive else None
             s2.filter_action(rig, st.filter_method, st.cutoff_hz, strength=st.filter_strength, confidence=confidence,
                              adaptive=st.filter_adaptive, filter_location=st.filter_location,
-                             filter_rotation=st.filter_rotation, euro_beta=st.euro_beta, unit=common.profile_of(rig).unit)
+                             filter_rotation=st.filter_rotation, euro_beta=st.euro_beta, unit=common.profile_of(rig).unit,
+                             max_shift=st.filter_max_shift)
             steps.append(f"filter {st.cutoff_hz:.0f} Hz")
         if rigify and st.pipe_level:
             r = s3.level_floor(rig, None, floor_z=st.floor_z, floor_object=st.floor_object)
@@ -746,8 +753,11 @@ class MOCAP_OT_run_all(_MocapOperator):
             res = common.run_solve(context, rig)
             steps.append("solve")
         common.end_edit(context, rig)
-        common.run_analyze(context, rig)
-        return "Done: " + ", ".join(steps) + ". Left: " + rig.mocap_cleanup.analysis_summary
+        after = common.run_analyze(context, rig)
+        # say how far the cleanup moved the body: the one number that tells whether it is still the same take
+        change = s1.largest_change(before, after.joints, after.f0)
+        moved = f" Largest change: {change[0]} {change[1] * 100:.1f} cm at frame {change[2]}." if change and change[1] > 5e-4 else ""
+        return "Done: " + ", ".join(steps) + "." + moved + " Left: " + rig.mocap_cleanup.analysis_summary
 
 
 CLASSES = (
