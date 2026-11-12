@@ -842,7 +842,8 @@ class MOCAP_OT_run_all(_MocapOperator):
             note = _floor_note(fit, rig.mocap_cleanup.sole_offset, common.profile_of(rig).unit)
             i = steps.index("")
             steps[i:i + 1] = [note] if note else []
-        common.end_edit(context, rig)
+        # the solve synced the chains; settling the take on the floor moves both of them alike
+        common.end_edit(context, rig, sync=not (rigify and st.pipe_solve))
         after = common.run_analyze(context, rig)
         # say how far the cleanup moved the body: the one number that tells whether it is still the same take.
         # The floor shift moves every joint alike and is reported on its own, so it is not part of it.

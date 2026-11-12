@@ -205,10 +205,10 @@ def sync(rig, profile, f0: int | None = None, f1: int | None = None) -> list[str
                 changed = True
             if changed:
                 written.append(limb.label)
-    for limb in limbs:
-        fk_on = _switch(rig, limb, f0, f1) > 1.0 - 1e-4
-        if fk_on.any() and _ik_follows_fk(rig, profile, limb, f0, f1, fk_on) and limb.label not in written:
-            written.append(limb.label)
+    items = [(limb, _switch(rig, limb, f0, f1) > 1.0 - 1e-4) for limb in limbs]
+    for label in _ik_follows_fk(rig, profile, [(l, m) for l, m in items if m.any()], f0, f1):
+        if label not in written:
+            written.append(label)
     _last[rig.name] = action_io.action_checksum(rig)
     return written
 
@@ -229,53 +229,68 @@ def _write_pose(rig, bone: str, f0: int, P_new: np.ndarray, P_par, mask: np.ndar
     return True
 
 
-def _ik_follows_fk(rig, profile, limb, f0: int, f1: int, fk_on: np.ndarray) -> bool:
-    """Key the IK control (and turn the pole) of a limb so the IK chain sits where the FK chain is, on the
-    frames where FK is active. Returns True if anything was written."""
+def _ik_follows_fk(rig, profile, items, f0: int, f1: int) -> list[str]:
+    """Key the IK control (and turn the pole) of each limb so its IK chain sits where the FK chain is, on the
+    frames where FK is active. ``items``: ``[(limb, FK-active mask), ...]``. Two sampling passes for all limbs
+    together: the chains, then the poles once the IK controls have moved (a pole may hang from its IK control).
+    Returns the labels of the limbs written."""
     bones = rig.data.bones
-    ik = limb.ik_ctrl
-    if ik not in bones:
-        return False
-    par = bones[ik].parent
-    names = [ik, limb.org_upper, limb.org_lower, limb.org_end] + ([par.name] if par is not None else [])
-    smp = sampler.sample_objects([(rig, names)], f0, f1)[rig.name]
-    end = smp.pose_m(limb.org_end)
-    cur = smp.pose_m(ik)
-    gap = np.linalg.norm((cur @ limb.x_rest)[:, :3, 3] - end[:, :3, 3], axis=1)
+    items = [(l, m) for l, m in items if l.ik_ctrl in bones]
+    if not items:
+        return []
+    names = set()
+    for limb, _m in items:
+        names |= {limb.ik_ctrl, limb.org_upper, limb.org_lower, limb.org_end}
+        par = bones[limb.ik_ctrl].parent
+        if par is not None:
+            names.add(par.name)
+    smp = sampler.sample_objects([(rig, sorted(names))], f0, f1)[rig.name]
     scale = float(np.linalg.norm(smp.obj_world[0][:3, 0]))
-    todo = fk_on
-    if not todo.any() or float(gap[fk_on].max()) * scale <= 0.4 * AGREE * profile.unit:
-        return False
-    target = _orthonormal(end @ np.linalg.inv(limb.x_rest))
-    P_par = smp.pose_m(par.name) if par is not None and smp.has(par.name) else None
-    _write_pose(rig, ik, f0, np.where(todo[:, None, None], target, cur), P_par, todo)
-    # the pole: turned about the limb (root -> end) onto the side the FK chain bends to. A straight limb,
-    # or one bent the other way than the pole says, keeps its pole (a turn of more than 90 degrees would
-    # roll the IK chain over).
-    pole = limb.pole_ctrl
-    if not pole or pole not in bones:
-        return True
-    ppar = bones[pole].parent
-    names = [pole] + ([ppar.name] if ppar is not None else [])
-    smp2 = sampler.sample_objects([(rig, names)], f0, f1)[rig.name]       # after the IK control moved
-    Pp = smp2.pose_m(pole)
-    a, b, c = (smp.pose_m(n)[:, :3, 3] for n in (limb.org_upper, limb.org_lower, limb.org_end))
-    ax = c - a
-    L = np.linalg.norm(ax, axis=1)
-    ax /= np.maximum(L, 1e-12)[:, None]
-    u = (b - a) - ax * np.sum((b - a) * ax, axis=1)[:, None]
-    w = (Pp[:, :3, 3] - a) - ax * np.sum((Pp[:, :3, 3] - a) * ax, axis=1)[:, None]
-    nu, nw = np.linalg.norm(u, axis=1), np.linalg.norm(w, axis=1)
-    ang = np.arctan2(np.sum(np.cross(w, u) * ax, axis=1), np.sum(w * u, axis=1))
-    turn = fk_on & (nu > 1e-3 * L) & (nw > 1e-9) & (np.abs(ang) < 0.5 * np.pi) & (np.abs(ang) > 1e-4)
-    if not turn.any():
-        return True
-    # Rodrigues about ax by ang
-    k = ax
-    cos, sin = np.cos(ang)[:, None], np.sin(ang)[:, None]
-    w_new = w * cos + np.cross(k, w) * sin + k * np.sum(k * w, axis=1)[:, None] * (1.0 - cos)
-    P_new = Pp.copy()
-    P_new[:, :3, 3] = np.where(turn[:, None], Pp[:, :3, 3] - w + w_new, Pp[:, :3, 3])
-    P_ppar = smp2.pose_m(ppar.name) if ppar is not None and smp2.has(ppar.name) else None
-    _write_pose(rig, pole, f0, P_new, P_ppar, turn, loc_only=True)
-    return True
+    done = []
+    for limb, fk_on in items:
+        end = smp.pose_m(limb.org_end)
+        cur = smp.pose_m(limb.ik_ctrl)
+        gap = np.linalg.norm((cur @ limb.x_rest)[:, :3, 3] - end[:, :3, 3], axis=1)
+        if float(gap[fk_on].max()) * scale <= 0.4 * AGREE * profile.unit:
+            continue
+        par = bones[limb.ik_ctrl].parent
+        P_par = smp.pose_m(par.name) if par is not None and smp.has(par.name) else None
+        target = _orthonormal(end @ np.linalg.inv(limb.x_rest))
+        _write_pose(rig, limb.ik_ctrl, f0, np.where(fk_on[:, None, None], target, cur), P_par, fk_on)
+        done.append((limb, fk_on))
+    if not done:
+        return []
+    # the poles: turned about the limb (root -> end) onto the side the FK chain bends to. A straight limb, or
+    # one bent the other way than the pole says, keeps its pole (more than 90 degrees would roll the chain over).
+    pnames = set()
+    for limb, _m in done:
+        if limb.pole_ctrl and limb.pole_ctrl in bones:
+            pnames.add(limb.pole_ctrl)
+            pp = bones[limb.pole_ctrl].parent
+            if pp is not None:
+                pnames.add(pp.name)
+    smp2 = sampler.sample_objects([(rig, sorted(pnames))], f0, f1)[rig.name] if pnames else None
+    for limb, fk_on in done:
+        pole = limb.pole_ctrl
+        if smp2 is None or not pole or pole not in bones:
+            continue
+        Pp = smp2.pose_m(pole)
+        a, b, c = (smp.pose_m(n)[:, :3, 3] for n in (limb.org_upper, limb.org_lower, limb.org_end))
+        ax = c - a
+        L = np.linalg.norm(ax, axis=1)
+        ax /= np.maximum(L, 1e-12)[:, None]
+        u = (b - a) - ax * np.sum((b - a) * ax, axis=1)[:, None]
+        w = (Pp[:, :3, 3] - a) - ax * np.sum((Pp[:, :3, 3] - a) * ax, axis=1)[:, None]
+        nu, nw = np.linalg.norm(u, axis=1), np.linalg.norm(w, axis=1)
+        ang = np.arctan2(np.sum(np.cross(w, u) * ax, axis=1), np.sum(w * u, axis=1))
+        turn = fk_on & (nu > 1e-3 * L) & (nw > 1e-9) & (np.abs(ang) < 0.5 * np.pi) & (np.abs(ang) > 1e-4)
+        if not turn.any():
+            continue
+        cos, sin = np.cos(ang)[:, None], np.sin(ang)[:, None]
+        w_new = w * cos + np.cross(ax, w) * sin + ax * np.sum(ax * w, axis=1)[:, None] * (1.0 - cos)
+        P_new = Pp.copy()
+        P_new[:, :3, 3] = np.where(turn[:, None], Pp[:, :3, 3] - w + w_new, Pp[:, :3, 3])
+        pp = bones[pole].parent
+        P_ppar = smp2.pose_m(pp.name) if pp is not None and smp2.has(pp.name) else None
+        _write_pose(rig, pole, f0, P_new, P_ppar, turn, loc_only=True)
+    return [limb.label for limb, _m in done]
