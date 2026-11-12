@@ -11,8 +11,9 @@ snapshot, when the first edit is made), and after every edit the FK controls are
 follow the result wherever IK is active. Limbs whose chains did not agree to begin with are left
 alone - there the second chain is somebody's work, not a copy.
 
-Not covered: takes where FK is active and the IK chain is the copy. The filter and the repair
-change both chains alike there; the solver switches such a limb to IK where it corrects it.
+Where FK is active (arms in a Rig Bridge bake) it is the other way round: the IK control is keyed
+to where the cleaned FK hand / foot is, and the pole is turned about the limb onto the FK bend. The
+filter does not change both chains alike: on a real take they drifted 0.3-0.8 cm apart.
 """
 
 from __future__ import annotations
@@ -204,5 +205,77 @@ def sync(rig, profile, f0: int | None = None, f1: int | None = None) -> list[str
                 changed = True
             if changed:
                 written.append(limb.label)
+    for limb in limbs:
+        fk_on = _switch(rig, limb, f0, f1) > 1.0 - 1e-4
+        if fk_on.any() and _ik_follows_fk(rig, profile, limb, f0, f1, fk_on) and limb.label not in written:
+            written.append(limb.label)
     _last[rig.name] = action_io.action_checksum(rig)
     return written
+
+
+def _write_pose(rig, bone: str, f0: int, P_new: np.ndarray, P_par, mask: np.ndarray, loc_only: bool = False) -> bool:
+    """Key ``bone`` to the pose matrices ``P_new`` on the frames of ``mask`` (other frames as they are)."""
+    loc, quat = sampler.pose_to_basis(rig, bone, P_new, P_par)
+    have = action_io.read_bone_local_channels(rig, bone, f0, f0 + len(P_new) - 1)
+    loc = np.where(mask[:, None], loc, have["loc"])
+    if loc_only:
+        action_io.write_bone_local_channels(rig, bone, f0, loc=loc)
+        return True
+    ref = quat_hemisphere_continuous(have["quat"])[0]
+    quat = quat_hemisphere_continuous(np.where(mask[:, None], quat, ref))[0]
+    if float(np.sum(quat * ref)) < 0.0:
+        quat = -quat
+    action_io.write_bone_local_channels(rig, bone, f0, loc=loc, quat=quat)
+    return True
+
+
+def _ik_follows_fk(rig, profile, limb, f0: int, f1: int, fk_on: np.ndarray) -> bool:
+    """Key the IK control (and turn the pole) of a limb so the IK chain sits where the FK chain is, on the
+    frames where FK is active. Returns True if anything was written."""
+    bones = rig.data.bones
+    ik = limb.ik_ctrl
+    if ik not in bones:
+        return False
+    par = bones[ik].parent
+    names = [ik, limb.org_upper, limb.org_lower, limb.org_end] + ([par.name] if par is not None else [])
+    smp = sampler.sample_objects([(rig, names)], f0, f1)[rig.name]
+    end = smp.pose_m(limb.org_end)
+    cur = smp.pose_m(ik)
+    gap = np.linalg.norm((cur @ limb.x_rest)[:, :3, 3] - end[:, :3, 3], axis=1)
+    scale = float(np.linalg.norm(smp.obj_world[0][:3, 0]))
+    todo = fk_on
+    if not todo.any() or float(gap[fk_on].max()) * scale <= 0.4 * AGREE * profile.unit:
+        return False
+    target = _orthonormal(end @ np.linalg.inv(limb.x_rest))
+    P_par = smp.pose_m(par.name) if par is not None and smp.has(par.name) else None
+    _write_pose(rig, ik, f0, np.where(todo[:, None, None], target, cur), P_par, todo)
+    # the pole: turned about the limb (root -> end) onto the side the FK chain bends to. A straight limb,
+    # or one bent the other way than the pole says, keeps its pole (a turn of more than 90 degrees would
+    # roll the IK chain over).
+    pole = limb.pole_ctrl
+    if not pole or pole not in bones:
+        return True
+    ppar = bones[pole].parent
+    names = [pole] + ([ppar.name] if ppar is not None else [])
+    smp2 = sampler.sample_objects([(rig, names)], f0, f1)[rig.name]       # after the IK control moved
+    Pp = smp2.pose_m(pole)
+    a, b, c = (smp.pose_m(n)[:, :3, 3] for n in (limb.org_upper, limb.org_lower, limb.org_end))
+    ax = c - a
+    L = np.linalg.norm(ax, axis=1)
+    ax /= np.maximum(L, 1e-12)[:, None]
+    u = (b - a) - ax * np.sum((b - a) * ax, axis=1)[:, None]
+    w = (Pp[:, :3, 3] - a) - ax * np.sum((Pp[:, :3, 3] - a) * ax, axis=1)[:, None]
+    nu, nw = np.linalg.norm(u, axis=1), np.linalg.norm(w, axis=1)
+    ang = np.arctan2(np.sum(np.cross(w, u) * ax, axis=1), np.sum(w * u, axis=1))
+    turn = fk_on & (nu > 1e-3 * L) & (nw > 1e-9) & (np.abs(ang) < 0.5 * np.pi) & (np.abs(ang) > 1e-4)
+    if not turn.any():
+        return True
+    # Rodrigues about ax by ang
+    k = ax
+    cos, sin = np.cos(ang)[:, None], np.sin(ang)[:, None]
+    w_new = w * cos + np.cross(k, w) * sin + k * np.sum(k * w, axis=1)[:, None] * (1.0 - cos)
+    P_new = Pp.copy()
+    P_new[:, :3, 3] = np.where(turn[:, None], Pp[:, :3, 3] - w + w_new, Pp[:, :3, 3])
+    P_ppar = smp2.pose_m(ppar.name) if ppar is not None and smp2.has(ppar.name) else None
+    _write_pose(rig, pole, f0, P_new, P_ppar, turn, loc_only=True)
+    return True
