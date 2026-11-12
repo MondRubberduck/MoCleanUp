@@ -39,7 +39,7 @@ def flush() -> int:
                 common.run_solve(bpy.context, rig)
                 done += 1
             except Exception as exc:                      # never let a timer raise
-                rig.mocap_cleanup.last_result = f"Solve failed: {exc}"
+                common.set_result(rig, f"Solve failed: {exc}")
     finally:
         _busy = False
     return done

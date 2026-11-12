@@ -6,7 +6,7 @@ import bpy
 from bpy.app.handlers import persistent
 
 from . import props
-from .core import runtime, sampler
+from .core import raw_snapshot, runtime, sampler
 from .overlays import draw, pin_tracks
 from .ui import autosolve, operators, panels, workspace
 
@@ -18,6 +18,10 @@ CLASSES = (*operators.CLASSES, pin_tracks.MOCAP_OT_pin_track_edit, workspace.MOC
 def _on_load(_dummy=None):
     runtime.clear_all()
     sampler.reset_cache()
+    try:
+        raw_snapshot.purge_orphans()
+    except Exception as exc:                 # never break loading a file
+        print("[MoCap Cleanup] could not tidy helper actions:", exc)
 
 
 def _topbar_button(self, context):

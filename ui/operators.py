@@ -56,7 +56,7 @@ class _MocapOperator(Operator):
             self.report({"INFO"}, msg)
             rig = common.get_rig(context)
             if rig is not None:
-                rig.mocap_cleanup.last_result = msg
+                common.set_result(rig, msg)
         common.tag_redraw()
         return {"FINISHED"}
 
@@ -344,6 +344,11 @@ class MOCAP_OT_restore_raw(_MocapOperator):
         whole = fs is None and bones is None and self.factor >= 1.0
         resolve = solver.unbake_for_edit(rig)
         n = raw_snapshot.restore_region_to_raw(rig, fs, fe, self.factor, st.restore_blend, bones)
+        if whole:
+            # the take is the capture again: nothing left to restore, no solve on top of it
+            raw_snapshot.drop_solve_base(rig)
+            raw_snapshot.delete_raw_snapshot(rig)
+            raw_snapshot.purge_orphans()
         common.end_edit(context, rig, resolve and not whole, sync=not whole)      # the whole take: exactly as it was
         return f"Restored {n} curves" + ("" if not whole else " (pins are kept; press Solve to apply them again)")
 

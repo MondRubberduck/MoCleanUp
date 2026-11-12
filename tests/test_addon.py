@@ -202,6 +202,7 @@ def test_run_all_simplify_restore_reload():
     # keys stage: residual layer blocks the other stages until it is merged
     keys_before = sum(len(fc.keyframe_points) for fc in action_io.iter_fcurves(rig))
     profile, dense = sample_rig(rig)
+    bpy.context.scene.mocap_cleanup.simplify_residual = True      # opt-in since the layer is off by default
     assert bpy.ops.mocap.simplify() == {"FINISHED"} and s6.has_residual(rig)
     keys_after = sum(len(fc.keyframe_points) for fc in action_io.iter_fcurves(rig))
     assert keys_after < 0.5 * keys_before

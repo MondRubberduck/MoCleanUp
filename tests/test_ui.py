@@ -137,7 +137,8 @@ def test_every_panel_layout():
     assert {"target_object", "use_reference", "reference_frame"} <= draw_panel(panels._MainPanel)["props"]
     with props.suspend_updates():
         pin.mode, pin.target_object = "FLOOR", None
-    # the Keys stage with a residual layer
+    # the Keys stage with a residual layer (opt-in since it is off by default)
+    st.simplify_residual = True
     assert bpy.ops.mocap.simplify() == {"FINISHED"} and s6.has_residual(rig)
     st.stage = "SIMPLIFY"
     assert {"mocap.toggle_residual", "mocap.merge_residual"} <= draw_panel(panels._MainPanel)["ops"]

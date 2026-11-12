@@ -186,6 +186,7 @@ class MCRigData(PropertyGroup):
     has_floor_estimate: BoolProperty(default=False)
     sole_offset: FloatProperty(default=0.0, description="How far the character mesh rests below the rig's sole points")
     last_result: StringProperty()
+    last_result_take: StringProperty()
 
     def pin_data(self) -> list[KinematicPin]:
         return [p.to_data() for p in self.pins]
@@ -318,8 +319,10 @@ class MCSettings(PropertyGroup):
     # stage 6
     simplify_tol_loc: FloatProperty(name="Location", default=0.002, min=0.0001, max=0.1, unit="LENGTH", precision=4)
     simplify_tol_rot: FloatProperty(name="Rotation", default=0.5, min=0.01, max=10.0, description="Degrees")
-    simplify_residual: BoolProperty(name="Residual Detail Layer", default=True,
-                                    description="Keep what the sparse keys cannot express on an NLA layer")
+    simplify_residual: BoolProperty(name="Residual Detail Layer", default=False,
+                                    description="Keep what the sparse keys cannot express on an NLA layer. Off by "
+                                                "default: other tools (re-bakes, retargeting, export) read the action "
+                                                "and leave that layer behind, so they would get the sparse keys only")
     simplify_keep_contacts: BoolProperty(name="Keys at Contacts", default=True,
                                          description="Always keep a key where a pin starts or ends")
 

@@ -41,6 +41,25 @@ def is_helper_action(action) -> bool:
     return action is not None and any(action.get(k) for k in HELPER_FLAGS)
 
 
+LINK_KEYS = (RAW_LINK_KEY, BASE_LINK_KEY, "mc_residual")
+
+
+def purge_orphans() -> int:
+    """Remove helper actions (raw snapshot, solve base, residual detail) that no take links to any more,
+    because their take was deleted or another tool replaced it. They carry a fake user, so Blender would keep
+    them forever otherwise. Returns how many went."""
+    linked = set()
+    for a in bpy.data.actions:
+        if not is_helper_action(a):
+            linked |= {str(a.get(k)) for k in LINK_KEYS if a.get(k)}
+    gone = 0
+    for a in list(bpy.data.actions):
+        if is_helper_action(a) and a.name not in linked and a.library is None and a.users - int(a.use_fake_user) == 0:
+            bpy.data.actions.remove(a)
+            gone += 1
+    return gone
+
+
 # ---------------------------------------------------------------------------
 # F-Curve copy helper
 # ---------------------------------------------------------------------------
@@ -100,6 +119,7 @@ def ensure_raw_snapshot(obj, force_overwrite: bool = False):
         return existing
     if existing is not None:
         bpy.data.actions.remove(existing)
+    purge_orphans()
     snap = act.copy()
     snap.name = f".{act.name}.raw"
     snap.use_fake_user = True

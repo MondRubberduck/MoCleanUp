@@ -425,9 +425,9 @@ class _MainPanel:
             body.label(text="This stage needs Rigify IK controls", icon="ERROR")
             return
         STAGE_DRAW[st.stage](body, context, st, rig)
-        data = rig.mocap_cleanup
-        if data.last_result:
-            _wrapped(layout.box(), context, data.last_result)
+        text = common.result_for(rig)
+        if text:
+            _wrapped(layout.box(), context, text)
 
 
 class _OverlayPanel:

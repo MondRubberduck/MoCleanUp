@@ -155,11 +155,28 @@ def run_solve(context, rig, use_cache: bool = True):
     data = rig.mocap_cleanup
     res = solver.solve(rig, data.pin_data(), props.solve_settings(st, scene_fps(context.scene), data.sole_offset),
                        use_cache=use_cache)
-    data.last_result = res.summary()
+    set_result(rig, res.summary())
     data.analysis_stale = True
     sync_chains(rig)
     tag_redraw()
     return res
+
+
+def set_result(rig, text: str) -> None:
+    """The last result line, for the take that is on the rig now."""
+    data = rig.mocap_cleanup
+    act = action_io.get_active_action(rig)
+    data.last_result = text
+    data.last_result_take = act.name if act is not None else ""
+
+
+def result_for(rig) -> str:
+    """The last result line if it is about the take on the rig now (another tool may have replaced it)."""
+    data = rig.mocap_cleanup
+    act = action_io.get_active_action(rig)
+    if not data.last_result or (data.last_result_take and (act is None or act.name != data.last_result_take)):
+        return ""
+    return data.last_result
 
 
 def floor_for(context, rig) -> float:
