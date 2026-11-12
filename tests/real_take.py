@@ -1,20 +1,26 @@
-"""Run the INSTALLED extension on a real take, headless, and measure what it did.
+"""Run the add-on on a real take, headless, and check that it did no harm.
 
     blender -b -y --python tests/real_take.py -- <file.blend> <rig name> [options]
 
+    source=1            use this source tree instead of the installed extension (add --factory-startup)
+    expect=<text>       fail unless the extension was loaded from a path that contains <text>
+    preset=<name>       apply a Source preset first: OPTICAL, IMU or VIDEO
+    set=<prop>:<value>,...   settings of the MoCap panel to change first (scene.mocap_cleanup)
     render=<dir>        contact sheets, raw on top and cleaned below (Workbench): feet close-up and whole body
     body=<frame,...>    frames of the body sheet (default: four spread over the take)
     feet=<frame,...>    frames of the feet sheet (default: around the deepest floor penetration)
     save=<copy.blend>   save the cleaned take as a COPY (plus <copy.blend>.npz with raw and cleaned curves)
-    expect=<text>       fail unless the extension was loaded from a path that contains <text>
+    keys=0              skip the key reduction at the end
 
-The file is opened and changed in memory only, it is never saved in place. Do not pass
-``--factory-startup``: the extension has to be installed and is loaded from the Blender profile
-(use ``BLENDER_USER_RESOURCES`` to point at a clean one). Nothing is imported from this repository.
+The file is opened and changed in memory only, it is never saved in place. Without ``source=1`` do
+not pass ``--factory-startup``: the extension is loaded from the Blender profile (point
+``BLENDER_USER_RESOURCES`` at a clean one) and nothing is imported from this repository but
+``harm.py``, which only measures.
 
-Prints: issues before, the one-click result, foot slide / sole depth / knee acceleration before and
-after, the lowest point of the character MESH below the floor before and after (what is seen, not what
-the rig model says), key reduction and whether Restore Raw is exact. Ends with ``RESULT: ok``.
+Prints what Clean Up Take reports, then what it did to the body (``harm.py``): how far feet were
+carried, how far the hips were lowered, knee acceleration, joint pops, whether the IK and FK chains
+still agree, where the character mesh rests. Ends with ``RESULT: ok`` only if every limit holds
+and Restore Raw is exact.
 """
 import importlib
 import math
@@ -27,12 +33,20 @@ import bpy
 import numpy as np
 from mathutils import Vector
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import harm  # noqa: E402
+
 PKG = "bl_ext.user_default.mocap_cleanup"
 args = sys.argv[sys.argv.index("--") + 1:]
 path, rig_name = args[0], args[1]
 opts = dict(a.split("=", 1) for a in args[2:])
 
-if PKG not in bpy.context.preferences.addons:
+if opts.get("source", "0") not in ("", "0"):
+    import _common  # noqa: E402,F401  (loads the source tree as ``mocap_cleanup``)
+    PKG = "mocap_cleanup"
+    if not hasattr(bpy.types.Scene, "mocap_cleanup"):
+        sys.modules[PKG].register()
+elif PKG not in bpy.context.preferences.addons:
     print("extension was not enabled in this profile; enabling:", bpy.ops.preferences.addon_enable(module=PKG))
 pkg = importlib.import_module(PKG)
 where = pkg.__file__.replace("\\", "/")
@@ -44,6 +58,13 @@ sampler = importlib.import_module(PKG + ".core.sampler")
 ri = importlib.import_module(PKG + ".core.rig_inspector")
 s1 = importlib.import_module(PKG + ".stages.stage1_diagnostics")
 
+
+class mods:
+    pass
+
+
+mods.action_io, mods.sampler, mods.ri, mods.s1 = action_io, sampler, ri, s1
+
 bpy.ops.wm.open_mainfile(filepath=path, load_ui=False)
 scene = bpy.context.scene
 rig = bpy.data.objects[rig_name]
@@ -51,6 +72,14 @@ st = scene.mocap_cleanup
 st.rig = rig
 bpy.context.view_layer.objects.active = rig
 data = rig.mocap_cleanup
+if "preset" in opts:
+    st.preset = opts["preset"]
+    print("  preset:", bpy.ops.mocap.apply_preset(), opts["preset"])
+for item in filter(None, opts.get("set", "").split(",")):
+    key, value = item.split(":", 1)
+    cur = getattr(st, key)
+    setattr(st, key, (value.lower() in ("1", "true", "on")) if isinstance(cur, bool) else type(cur)(value))
+    print(f"  set {key} = {getattr(st, key)!r}")
 f0, f1 = action_io.get_action_frame_range(rig)
 T = f1 - f0 + 1
 
@@ -89,37 +118,6 @@ def measure(profile, smp, pins, floor_z):
 
 
 # ---- rendering ------------------------------------------------------------------------------------------------------
-def mesh_lowest(meshes):
-    """Lowest world z of the deformed character meshes at every frame: ``(T,)``."""
-    out = np.full(T, np.inf)
-    cur = scene.frame_current
-    for i in range(T):
-        scene.frame_set(f0 + i)
-        dg = bpy.context.evaluated_depsgraph_get()
-        for ob in meshes:
-            ev = ob.evaluated_get(dg)
-            me = ev.to_mesh()
-            co = np.empty(len(me.vertices) * 3)
-            me.vertices.foreach_get("co", co)
-            M = np.array(ev.matrix_world)
-            out[i] = min(out[i], float((co.reshape(-1, 3) @ M[2, :3] + M[2, 3]).min()))
-            ev.to_mesh_clear()
-    scene.frame_set(cur)
-    return out
-
-
-def character_meshes():
-    out = []
-    for ob in scene.objects:
-        if ob.type == "MESH":
-            for m in ob.modifiers:
-                arm = m.object if m.type == "ARMATURE" else None
-                if arm is not None and (arm == rig or any(getattr(c, "target", None) == rig for pb in arm.pose.bones for c in pb.constraints)):
-                    out.append(ob)
-                    break
-    return out
-
-
 def checker_floor(center, z, size=6.0, cell=0.05):
     n = int(size / cell)
     xs = np.arange(n + 1) * cell - 0.5 * size
@@ -201,15 +199,15 @@ print(f"rig {rig.name!r} frames {f0}-{f1} @ {scene.render.fps} fps, {len(raw)} c
 print("  analyze:", data.analysis_summary)
 profile, smp0 = sample()
 unit = profile.unit
-skin = character_meshes()
-low0 = mesh_lowest(skin) if skin else None
+skin = harm.character_meshes(scene, rig)
+before = harm.take(mods, scene, rig, f0, f1, skin)
 
 shots = None
 if "render" in opts:
     out_dir = opts["render"]
     os.makedirs(out_dir, exist_ok=True)
     tag = rig.name.replace(".", "_")
-    meshes = character_meshes()
+    meshes = skin
     print("  character meshes:", [m.name for m in meshes])
     for ob in scene.objects:
         if ob.type in {"MESH", "CURVE", "SURFACE", "FONT", "META", "VOLUME", "POINTCLOUD", "CURVES"} and ob not in meshes:
@@ -286,7 +284,8 @@ print(f"  one click ({time.time() - t:.1f}s): {data.last_result}")
 profile, smp1 = sample()
 b, a = measure(profile, smp0, data.pins, st.floor_z), measure(profile, smp1, data.pins, st.floor_z)
 print(f"  {a[3]} plants | slide {b[0]:.1f} -> {a[0]:.2f} mm | below floor {b[1]:.1f} -> {a[1]:.2f} mm | knee accel {b[2]:.1f} -> {a[2]:.1f} deg/f^2")
-print("  pins:", [(p.owner, p.mode, p.lock_in, p.lock_out) for p in data.pins])
+spans = sorted(((p.lock_out - p.lock_in + 1, p.owner, p.lock_in, p.lock_out) for p in data.pins), reverse=True)
+print(f"  {len(spans)} pins" + (f", the longest: {[(o, i, j) for _n, o, i, j in spans[:4]]}" if spans else ""))
 cleaned = curves()
 m = re.search(r"Largest change: (.+?) ([0-9.]+) cm at frame (\d+)", data.last_result)
 if m:
@@ -300,17 +299,10 @@ if m:
         with np.printoptions(precision=1, suppress=True):
             print(f"  largest change, {name} at frame {frame}: cm off the line between the neighbouring frames, frames {frame - 2}..{frame + 2}: "
                   f"raw {flick(j0)} -> cleaned {flick(j1)}")
-if low0 is not None:
-    low1 = mesh_lowest(skin)
-    # The mesh has its own sole, a little below or above the sole points of the rig. Its floor is
-    # where it is while the rig says a foot rests on the floor.
-    rig_low = np.min([p[..., 2].min(axis=1) for p in soles(profile, smp0).values()], axis=0)
-    resting = np.abs(rig_low - st.floor_z) < 0.01 * unit
-    skin_floor = st.floor_z - (float(np.median((rig_low - low0)[resting])) if resting.sum() >= 3 else 0.0)
-    print(f"  floor: rig soles rest at {st.floor_z * 100:.1f} cm, the mesh at {skin_floor * 100:.1f} cm")
-    d0, d1 = (skin_floor - low0) / unit * 100, (skin_floor - low1) / unit * 100
-    print(f"  character mesh {[m.name for m in skin]}: lowest point below the floor {d0.max():.1f} cm (frame {int(np.argmax(d0)) + f0}) "
-          f"-> {d1.max():.2f} cm (frame {int(np.argmax(d1)) + f0}); frames deeper than 5 mm: {int((d0 > 0.5).sum())} -> {int((d1 > 0.5).sum())}")
+after = harm.take(mods, scene, rig, f0, f1, skin)
+rows, failed = harm.compare(before, after, st.floor_z)
+print(f"  what it did to the body (floor at {st.floor_z / unit * 100:.1f} cm" + (f", mesh {[m.name for m in skin]}" if skin else ", no character mesh") + "):")
+harm.print_rows(rows)
 
 if shots is not None:
     shots["clean"] = shoot("clean")
@@ -326,15 +318,18 @@ if "save" in opts:
     np.savez(opts["save"] + ".npz", f0=f0, f1=f1, **{"raw:" + k: v for k, v in raw.items()}, **{"clean:" + k: v for k, v in cleaned.items()})
     print("  saved a COPY:", opts["save"], "| original still", bpy.data.filepath)
 
-keys0 = sum(len(fc.keyframe_points) for fc in action_io.iter_fcurves(rig))
-r = bpy.ops.mocap.simplify()
-keys1 = sum(len(fc.keyframe_points) for fc in action_io.iter_fcurves(rig))
-print(f"  reduce keys: {r} {keys0} -> {keys1} keys | {data.last_result}")
-if bpy.ops.mocap.merge_residual.poll():
-    print("  merge detail layer:", bpy.ops.mocap.merge_residual())
+if opts.get("keys", "1") != "0":
+    keys0 = sum(len(fc.keyframe_points) for fc in action_io.iter_fcurves(rig))
+    r = bpy.ops.mocap.simplify()
+    keys1 = sum(len(fc.keyframe_points) for fc in action_io.iter_fcurves(rig))
+    print(f"  reduce keys: {r} {keys0} -> {keys1} keys | {data.last_result}")
+    if bpy.ops.mocap.merge_residual.poll():
+        print("  merge detail layer:", bpy.ops.mocap.merge_residual())
 assert bpy.ops.mocap.restore_raw() == {"FINISHED"}
 now = curves()
 worst_diff = max((float(np.abs(now[k] - v).max()) for k, v in raw.items() if k in now), default=0.0)
 print(f"  restore raw: max curve difference {worst_diff:.2e}, missing {len([k for k in raw if k not in now])}, extra {len([k for k in now if k not in raw])}")
-print("RESULT: ok" if worst_diff < 1e-6 else "RESULT: restore raw differs")
+if worst_diff >= 1e-6:
+    failed.append("Restore Raw is not exact")
+print("RESULT: ok" if not failed else "RESULT: FAILED - " + "; ".join(failed))
 sys.stdout.flush()
