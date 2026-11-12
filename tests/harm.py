@@ -16,6 +16,7 @@ import numpy as np
 LIMITS = {
     "foot_cm": 5.5,          # a pin may hold a foot where it is, not carry it somewhere else (horizontal)
     "pelvis_cm": 1.0,        # how far the hips are lowered, 95th percentile
+    "knee_turn": 10.0,       # degrees a bent knee may turn sideways about the hip-ankle line (knock-knees)
     "knee_accel": 1.5,       # knee acceleration: not above this many times the raw maximum ...
     "knee_accel_abs": 3000,  # ... when it also rises by this many deg/s^2
     "chains_cm": 0.5,        # IK and FK chain of a limb, where the take came with both in sync
@@ -119,17 +120,32 @@ def plant_slide(soles: dict, pins, f0: int, fps: float):
     return float(np.percentile(allv, 90)), float(allv.max())
 
 
-def knee_acceleration(profile, smp, fps: float) -> float:
-    """Largest knee angular acceleration of the take in deg/s^2."""
-    worst = 0.0
-    for leg in profile.legs.values():
+def knee_acceleration(profile, smp, fps: float):
+    """Largest knee angular acceleration of the take in deg/s^2, and where: ``(value, "L 286")``."""
+    worst, where = 0.0, ""
+    for S, leg in profile.legs.items():
         a = smp.head_w(leg.org_upper) - smp.head_w(leg.org_lower)
         b = smp.head_w(leg.org_end) - smp.head_w(leg.org_lower)
         cos = np.einsum("ti,ti->t", a, b) / (np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1) + 1e-12)
         ang = np.degrees(np.arccos(np.clip(cos, -1.0, 1.0)))
         if len(ang) >= 3:
-            worst = max(worst, float(np.abs(np.diff(ang, 2)).max()) * fps * fps)
-    return worst
+            acc = np.abs(np.diff(ang, 2)) * fps * fps
+            if float(acc.max()) > worst:
+                worst, where = float(acc.max()), f"{S} {smp.f0 + 1 + int(np.argmax(acc))}"
+    return worst, where
+
+
+def knee_planes(profile, smp):
+    """Per leg: which way the knee points (unit vectors across the hip-ankle line) and how far it is off that line."""
+    out = {}
+    for S, leg in profile.legs.items():
+        root, mid, end = smp.head_w(leg.org_upper), smp.head_w(leg.org_lower), smp.head_w(leg.org_end)
+        axis = end - root
+        axis /= np.linalg.norm(axis, axis=1, keepdims=True) + 1e-12
+        perp = (mid - root) - np.sum((mid - root) * axis, axis=1, keepdims=True) * axis
+        off = np.linalg.norm(perp, axis=1)
+        out[S] = (perp / (off[:, None] + 1e-12), off)
+    return out
 
 
 def take(mods, scene, rig, f0: int, f1: int, meshes=None, samples: int = 240) -> dict:
@@ -147,6 +163,7 @@ def take(mods, scene, rig, f0: int, f1: int, meshes=None, samples: int = 240) ->
         "profile": profile, "smp": smp, "unit": profile.unit, "f0": f0, "sparse": sparse,
         "joints": mods.s1.body_joints(profile, smp),
         "knee_accel": knee_acceleration(profile, smp, scene.render.fps / scene.render.fps_base),
+        "knee_planes": knee_planes(profile, smp),
         "chains": chain_agreement(scene, rig, profile, list(mods.action_io.iter_fcurves(rig)), sparse),
         "mesh_low": mesh_lowest(scene, meshes, sparse) if meshes else None,
         "issues": kinds,
@@ -179,8 +196,17 @@ def compare(before: dict, after: dict, floor_z: float, limits: dict | None = Non
     for name in sorted(n for n in before["joints"] if n.startswith(("Knee", "Hand", "Head"))):
         d = np.linalg.norm(after["joints"][name] - before["joints"][name], axis=1) / u
         row(f"{name} moved", "", f"{d.max():.1f} cm at frame {f0 + int(np.argmax(d))} (mean {d.mean():.1f})", "", None)
-    kb, ka = before["knee_accel"], after["knee_accel"]
-    row("Knee acceleration, max", f"{kb:.0f}", f"{ka:.0f} deg/s^2", f"{lim['knee_accel']} x raw",
+    for S in sorted(before["knee_planes"]):
+        (db, ob), (da, oa) = before["knee_planes"][S], after["knee_planes"][S]
+        bent = (ob > 2.0 * u) & (oa > 2.0 * u)                  # a knee that is 2 cm off the line points somewhere
+        if bent.any():
+            turn = np.degrees(np.arccos(np.clip(np.sum(db * da, axis=1), -1.0, 1.0)))
+            turn[~bent] = 0.0
+            i = int(np.argmax(turn))
+            row(f"Knee {S} turned sideways", "", f"{turn[i]:.1f} deg at frame {f0 + i} (p95 {np.percentile(turn[bent], 95):.1f})",
+                f"{lim['knee_turn']} deg", bool(turn[i] <= lim["knee_turn"]))
+    (kb, _wb), (ka, wa) = before["knee_accel"], after["knee_accel"]
+    row("Knee acceleration, max", f"{kb:.0f}", f"{ka:.0f} deg/s^2 (knee {wa})", f"{lim['knee_accel']} x raw",
         not (ka > lim["knee_accel"] * kb and ka - kb > lim["knee_accel_abs"]))
     pb, pa = before["issues"].get("KNEE_POP", 0), after["issues"].get("KNEE_POP", 0)
     row("Joint pops flagged", str(pb), str(pa), "not more", pa <= pb)

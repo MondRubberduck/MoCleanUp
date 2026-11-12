@@ -72,7 +72,9 @@ def test_knee_pops_with_planted_feet():
     print(f"   reach {max(m['reach_target'].max() for m in before.values()):.3f} -> {r_after:.4f}, "
           f"knee accel {pop_before:.0f} -> {pop_after:.0f} rad/s^2, pelvis drop {res.max_pelvis_drop * 100:.1f} cm, "
           f"min knee flexion {np.degrees(min(m['flex'].min() for m in after.values())):.1f} deg")
-    assert r_after <= st.max_extension + 2e-4, r_after
+    # A target the leg cannot get to comes back onto the reach of the leg. (It is not soft-clamped
+    # everywhere: a leg that is straight in the take stays straight. Only around the pops it is.)
+    assert r_after <= 1.0 + 2e-4, r_after
     # every frame that popped (far above a normal walk's ~130 rad/s^2) is calm now
     for S in ("L", "R"):
         popped = np.flatnonzero(before[S]["acc"] > 220.0)
@@ -97,8 +99,103 @@ def test_knee_pops_with_planted_feet():
     # without the pelvis tier soft IK alone keeps every leg below the limit
     res2 = solver.solve(rig, pins, solver.SolveSettings(use_pelvis=False))
     profile, smp3 = sample_rig(rig)
-    assert max(m["reach_target"].max() for m in leg_metrics(profile, smp3).values()) <= st.max_extension + 2e-4
+    assert max(m["reach_target"].max() for m in leg_metrics(profile, smp3).values()) <= 1.0 + 2e-4
     assert res2.softik_frames > 0 and res2.max_pelvis_drop == 0.0
+
+
+def _standing_take(rig, reach: float, n_frames: int = 60):
+    """Both feet on the floor, the hips swaying a little, the legs at ``reach`` of their length."""
+    T = n_frames
+    ident = np.tile([1.0, 0.0, 0.0, 0.0], (T, 1))
+    zero = np.zeros((T, 3))
+    for S in ("L", "R"):
+        action_io.write_bone_local_channels(rig, f"foot_ik.{S}", 1, loc=zero, quat=ident)
+    action_io.write_bone_local_channels(rig, "torso", 1, loc=zero, quat=ident)
+    bpy.context.scene.frame_start, bpy.context.scene.frame_end = 1, T
+    profile, smp = sample_rig(rig)
+    leg = profile.legs["L"]
+    hip, ankle = smp.head_w(leg.org_upper)[0], smp.head_w(leg.org_end)[0]
+    flat = float(np.linalg.norm((hip - ankle)[:2]))
+    rise = float(np.sqrt((reach * leg.max_reach) ** 2 - flat ** 2)) - float(hip[2] - ankle[2])
+    t = np.arange(T, dtype=np.float64)
+    torso = np.stack([0.004 * np.sin(2.0 * np.pi * t / T), np.zeros(T), rise + 0.0005 * np.cos(4.0 * np.pi * t / T)], axis=1)
+    action_io.write_bone_local_channels(rig, "torso", 1, loc=torso, quat=ident)
+    return T
+
+
+def test_a_straight_leg_stays_straight():
+    # Found by a QA pass: the knee guard soft-clamped every leg above 96.5 % of its length. Retargeted
+    # characters stand at 99.7-100 %, so one click bent the knees and lowered the hips on every
+    # standing frame, and "over-extension" was flagged all over a take that had none.
+    from mocap_cleanup.stages import stage1_diagnostics as s1
+    rig = fresh_rig()
+    set_limb_props(rig, ik_stretch=0.0, pole_vector=True)
+    T = _standing_take(rig, 0.998)
+    profile, smp = sample_rig(rig)
+    before = leg_metrics(profile, smp)
+    assert 0.996 < min(m["reach_target"].min() for m in before.values()) and max(m["reach_target"].max() for m in before.values()) < 1.0
+    rep = s1.analyze(rig)
+    flagged = [i for i in rep.issues if i.kind in ("HYPEREXT", "KNEE_POP")]
+    assert not flagged, [(i.kind, i.frame_start, i.frame_end, i.bone) for i in flagged]
+    knee0 = {S: smp.head_w(profile.legs[S].org_lower) for S in ("L", "R")}
+    hip0 = smp.head_w(profile.legs["L"].org_upper)
+    for auto in (True, False):                                       # detected plants, and pins made by hand
+        pins = [s4.KinematicPin(owner=f"leg.{S}", mode="FLOOR", lock_in=1, lock_out=T, blend_in=0, blend_out=0, auto=auto)
+                for S in ("L", "R")]
+        res = solver.solve(rig, pins, solver.SolveSettings())
+        profile, smp1 = sample_rig(rig)
+        after = leg_metrics(profile, smp1)
+        knee = max(float(np.linalg.norm(smp1.head_w(profile.legs[S].org_lower) - knee0[S], axis=1).max()) for S in ("L", "R"))
+        hips = float(np.abs(smp1.head_w(profile.legs["L"].org_upper) - hip0).max())
+        print(f"   standing at reach 0.998, {'detected' if auto else 'hand-made'} pins: hips move {hips * 1000:.2f} mm, "
+              f"knees {knee * 1000:.2f} mm, reach {min(m['reach_target'].min() for m in after.values()):.4f}")
+        assert res.max_pelvis_drop < 0.0005 and hips < 0.0005, (res.max_pelvis_drop, hips)
+        assert knee < 0.003, knee
+        assert min(m["reach_target"].min() for m in after.values()) > 0.996
+
+
+def test_a_sunk_foot_raises_the_body_not_the_knee():
+    # A foot 8 mm below the floor under a straight leg: lifting the foot alone bends the knee by 15
+    # degrees and moves it 5-6 cm. The hips are too low there, so the body goes up and the leg stays
+    # as the take has it. (On the QA take this was the largest part of "the cleanup bends the legs".)
+    rig = fresh_rig()
+    set_limb_props(rig, ik_stretch=0.0, pole_vector=True)
+    T = _standing_take(rig, 0.998)
+    profile, smp = sample_rig(rig)
+    low = min(float(sole_world(profile, smp, S)[..., 2].min()) for S in ("L", "R"))
+    hip0 = smp.head_w(profile.legs["L"].org_upper)
+
+    def knee_off(s, S):
+        leg = profile.legs[S]
+        root, mid, end = s.head_w(leg.org_upper), s.head_w(leg.org_lower), s.head_w(leg.org_end)
+        axis = (end - root) / np.linalg.norm(end - root, axis=1, keepdims=True)
+        rel = mid - root
+        return np.linalg.norm(rel - np.sum(rel * axis, axis=1, keepdims=True) * axis, axis=1)
+
+    off0 = {S: knee_off(smp, S) for S in ("L", "R")}
+    res = solver.solve(rig, [], solver.SolveSettings(floor_z=low + 0.008))
+    profile, smp1 = sample_rig(rig)
+    rise = smp1.head_w(profile.legs["L"].org_upper)[:, 2] - hip0[:, 2]
+    knee = max(float(np.abs(knee_off(smp1, S) - off0[S]).max()) for S in ("L", "R"))
+    sole = min(float(sole_world(profile, smp1, S)[..., 2].min()) for S in ("L", "R")) - (low + 0.008)
+    print(f"   feet 8 mm in the floor under straight legs: body raised {rise.min() * 1000:.1f}-{rise.max() * 1000:.1f} mm, "
+          f"knees leave their line by {knee * 1000:.1f} mm more, soles end {sole * 1000:+.1f} mm from the floor | {res.summary()}")
+    assert 0.005 < rise.min() and rise.max() < 0.0095, (rise.min(), rise.max())
+    assert knee < 0.004, knee                                         # without the fix: about 4 cm
+    assert -0.0025 < sole < 0.0005, sole                              # a straight leg may leave 2 mm in the floor
+    # bent legs take the lift themselves: the body stays (almost) where it is
+    rig = fresh_rig()
+    set_limb_props(rig, ik_stretch=0.0, pole_vector=True)
+    _standing_take(rig, 0.93)
+    profile, smp = sample_rig(rig)
+    low = min(float(sole_world(profile, smp, S)[..., 2].min()) for S in ("L", "R"))
+    hip0 = smp.head_w(profile.legs["L"].org_upper)
+    solver.solve(rig, [], solver.SolveSettings(floor_z=low + 0.008))
+    profile, smp1 = sample_rig(rig)
+    rise = smp1.head_w(profile.legs["L"].org_upper)[:, 2] - hip0[:, 2]
+    sole = min(float(sole_world(profile, smp1, S)[..., 2].min()) for S in ("L", "R")) - (low + 0.008)
+    print(f"   the same under bent legs: body raised {rise.max() * 1000:.1f} mm, soles end {sole * 1000:+.2f} mm from the floor")
+    assert rise.max() < 0.004 and abs(sole) < 0.0005, (rise.max(), sole)
 
 
 def test_heel_peel():
@@ -246,5 +343,7 @@ def test_body_capsules():
 
 
 if __name__ == "__main__":
-    run_tests([test_soft_reach_function, test_knee_pops_with_planted_feet, test_heel_peel, test_pole_whip_and_follow,
+    run_tests([test_soft_reach_function, test_knee_pops_with_planted_feet, test_a_straight_leg_stays_straight,
+               test_a_sunk_foot_raises_the_body_not_the_knee,
+               test_heel_peel, test_pole_whip_and_follow,
                test_ballistic_flight, test_body_capsules])

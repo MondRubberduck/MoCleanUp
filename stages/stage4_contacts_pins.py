@@ -226,8 +226,34 @@ def contact_probability(points: np.ndarray, floor: Floor, fps: float, height_tol
     s_v = np.exp(-((speed / max(speed_tol, 1e-9)) ** 2))
     prob = s_h * s_v
     if with_slip:
-        return prob, s_v, slip
+        return prob, s_v, slip, h_min
     return (prob, s_v) if with_stillness else prob
+
+
+def trim_to_arrival(height: np.ndarray, runs: list[tuple[int, int]], tol: float, max_trim: int, min_len: int = 3):
+    """Start a contact where the foot has landed and end it before it lifts.
+
+    A foot that comes down slowly is slow enough to count as planted two or three frames before it
+    is on the ground. A pin from there pulls it down early: a harder landing than the take has, and
+    on a nearly straight leg a visible snap of the knee. ``height (T,)``: lowest sole point above the
+    floor. Frames at either end that are more than ``tol`` above where the foot rests in this contact
+    are left to the blend (at most ``max_trim`` frames per side).
+    """
+    out = []
+    for s, e in runs:
+        seg = height[s : e + 1]
+        rest = float(np.median(seg))
+        # "above where it rests" has to stand out from how much the foot wobbles while it rests,
+        # and the foot has to be on its way (down at the start, up at the end): noise is not an arrival
+        t = max(tol, 3.0 * 1.4826 * float(np.median(np.abs(seg - rest))))
+        a, b = s, e
+        while a < e and a - s < max_trim and height[a] - rest > t and height[a] > height[a + 1]:
+            a += 1
+        while b > a and e - b < max_trim and height[b] - rest > t and height[b] > height[b - 1]:
+            b -= 1
+        if b - a + 1 >= min_len:
+            out.append((a, b))
+    return out
 
 
 def hysteresis_runs(prob: np.ndarray, on: float = 0.55, off: float = 0.35, max_gap: int = 3, min_len: int = 3):
@@ -296,12 +322,14 @@ def split_by_travel(slip: np.ndarray, runs: list[tuple[int, int]], travel: float
 
 def detect_contacts(end_points: dict[str, np.ndarray], floor: Floor, f0: int, fps: float, unit: float = 1.0,
                     height_tol: float = 0.04, speed_tol: float = 0.15, blend_in: int = 4, blend_out: int = 5,
-                    min_duration: float = 0.1, travel_tol: float = 0.03) -> tuple[list[KinematicPin], dict[str, np.ndarray]]:
+                    min_duration: float = 0.17, travel_tol: float = 0.03) -> tuple[list[KinematicPin], dict[str, np.ndarray]]:
     """Detect plants for every entry of ``end_points`` (``owner -> (T, K, 3)`` contact points).
 
     Tolerances are in metres / metres-per-second for a 1.75 m character and scaled by ``unit``.
     ``travel_tol``: a planted foot stays within this distance of one spot (``split_by_travel``;
-    0 = do not check). Returns the pins and the per-owner probability curves.
+    0 = do not check). ``min_duration``: a plant holds longer than a turning point does - a foot at
+    the bottom of a landing or the end of a kick is still for two or three frames, and a pin on
+    those drags it back and forth. Returns the pins and the per-owner probability curves.
     """
     both = {o: contact_probability(p, floor, fps, height_tol * unit, speed_tol * unit, with_slip=True)
             for o, p in end_points.items()}
@@ -326,6 +354,7 @@ def detect_contacts(end_points: dict[str, np.ndarray], floor: Floor, f0: int, fp
         runs = hysteresis_runs(prob, max_gap=max_gap, min_len=min_len)
         if travel_tol > 0.0:
             runs = split_by_travel(both[owner][2], runs, travel_tol * unit, min_len, creep=0.4 * speed_tol * unit / fps)
+        runs = trim_to_arrival(both[owner][3], runs, 0.003 * unit, max(1, int(round(0.2 * fps))), min_len)
         T = len(prob)
         for i, (s, e) in enumerate(runs):
             gap_before = s - (runs[i - 1][1] if i > 0 else -10 ** 6) - 1
@@ -453,7 +482,7 @@ def apply_pins(owner: str, pos: np.ndarray, quat: np.ndarray, pins: list[Kinemat
 
     ``targets``: ``{(object name, bone name): world matrices (T, 4, 4)}`` for ``TARGET`` pins.
     ``max_shift`` (world units, 0 = no limit) / ``max_yaw``: how far a *detected* floor pin may move
-    a foot along the floor / turn it. Detection can be wrong; a pin that would have to carry the
+    a foot along the floor / turn it. It pulls a foot down by a fifth of that at most. Detection can be wrong; a pin that would have to carry the
     foot further gives way there, and says so in ``notes`` (``(pin, distance, first, last frame)``).
     Pins made by hand hold whatever it takes.
     Returns ``(pos, quat, pin_weight (T,), planted_weight (T,), report)``.
@@ -486,6 +515,10 @@ def apply_pins(owner: str, pos: np.ndarray, quat: np.ndarray, pins: list[Kinemat
                 keep = np.where(far > 1e-12, soft_limit(far, max_shift) / np.maximum(far, 1e-12), 1.0)
                 p_t = p_t.copy()
                 p_t[:, :2] = pos[:, :2] + d * keep[:, None]
+                # Out of the floor: as far as it takes. Down onto the floor: a little. A foot that
+                # hovers 3 cm above the floor may be a plant that floats, or a foot held in the air.
+                dz = p_t[:, 2] - pos[:, 2]
+                p_t[:, 2] = pos[:, 2] + np.maximum(dz, 0.0) - soft_limit(np.maximum(-dz, 0.0), 0.2 * max_shift)
                 over = np.flatnonzero(far[li : lo + 1] > 0.75 * max_shift)
                 if len(over) and notes is not None:
                     notes.append((pin, float(far[li : lo + 1].max()), f0 + li + int(over[0]), f0 + li + int(over[-1])))
@@ -528,6 +561,23 @@ def apply_pins(owner: str, pos: np.ndarray, quat: np.ndarray, pins: list[Kinemat
     return pos, quat, weight, planted, report
 
 
+def planted_weight(owner: str, pins: list[KinematicPin], f0: int, T: int, auto: bool | None = None) -> np.ndarray:
+    """How firmly ``owner`` is held in place per frame (0..1) by its floor and world pins.
+
+    ``auto``: only detected pins (True), only pins made by hand (False), or all (None).
+    """
+    out = np.zeros(T)
+    for pin in pins:
+        if (pin.owner != owner or not pin.enabled or pin.mode not in ("FLOOR", "WORLD") or not pin.lock_location
+                or (auto is not None and bool(pin.auto) != auto)):
+            continue
+        if pin.lock_out < f0 or pin.lock_in > f0 + T - 1:
+            continue
+        out = np.maximum(out, blend_window_weights(T, pin.lock_in - f0, max(pin.lock_out, pin.lock_in) - f0,
+                                                   pin.blend_in, pin.blend_out))
+    return out
+
+
 def _same_hemisphere(ref: np.ndarray, q: np.ndarray) -> np.ndarray:
     q = np.broadcast_to(q, ref.shape)
     return np.where(np.sum(ref * q, axis=-1, keepdims=True) < 0.0, -q, q)
@@ -538,7 +588,7 @@ def _same_hemisphere(ref: np.ndarray, q: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 def floor_lift(points: np.ndarray, floor: Floor, cushion: int = 3, clearance: float = 0.0,
-               hold: np.ndarray | None = None) -> np.ndarray:
+               hold: np.ndarray | None = None, fast: float = 0.0) -> np.ndarray:
     """Upward offset ``(T,)`` that keeps all ``points (T, K, 3)`` at least ``clearance`` above the floor.
 
     Every frame is lifted by its own penetration. On top of that the frames around a violation
@@ -546,12 +596,21 @@ def floor_lift(points: np.ndarray, floor: Floor, cushion: int = 3, clearance: fl
     floor in mid-motion does not scrape along an invisible wall. The cushion never raises a frame
     by more than half its own height above the floor: a foot that has landed stays down instead of
     hovering. ``hold`` (0..1 per frame, e.g. the plant weight of a pin) switches the cushion off.
+
+    ``fast`` (height per frame, 0 = off): a foot that comes down faster than this is arriving, not
+    resting at the floor, and takes its full share of the cushion - also when it is already below
+    the floor and still going down (it lands where it stops, not where it crosses the plane).
+    Without it the frames of a hard landing are raised by 1.8, 0.9 and 2.0 cm in a row: the leg
+    stops in one frame, which shows as a snap in a nearly straight knee.
     """
     height = (points[..., 2] - floor.height(points) - clearance).min(axis=1)     # lowest point; negative = below
     pen = np.maximum(-height, 0.0)
     if not np.any(pen > 0.0):
         return np.zeros(len(points))
-    extra = np.minimum(upper_envelope(pen, cushion) - pen, 0.5 * np.maximum(height, 0.0))
+    cap = 0.5 * np.maximum(height, 0.0)
+    if fast > 0.0 and len(height) >= 3:
+        cap = cap + np.maximum(np.abs(np.gradient(height)) - fast, 0.0)
+    extra = np.minimum(upper_envelope(pen, cushion) - pen, cap)
     if hold is not None:
         extra = extra * (1.0 - np.clip(hold, 0.0, 1.0))
     return pen + extra

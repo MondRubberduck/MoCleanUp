@@ -89,6 +89,8 @@ class SolveResult:
     max_pelvis_drop: float = 0.0
     floor_frames: int = 0
     max_floor_lift: float = 0.0
+    max_body_lift: float = 0.0
+    max_floor_give: float = 0.0          # the most a foot was left in the floor to spare a straight knee
     softik_frames: int = 0
     heel_peel_frames: int = 0
     toe_frames: int = 0
@@ -107,6 +109,8 @@ class SolveResult:
             parts.append(f"floor: {self.floor_frames} frames")
         if self.max_pelvis_drop > 1e-5:
             parts.append(f"pelvis drop {self.max_pelvis_drop * 100:.1f} cm")
+        if self.max_body_lift > 1e-5:
+            parts.append(f"body raised {self.max_body_lift * 100:.1f} cm")
         if self.softik_frames:
             parts.append(f"soft IK: {self.softik_frames} frames")
         if self.toe_frames:
@@ -155,6 +159,9 @@ def _compose(pos: np.ndarray, quat: np.ndarray, scale: float) -> np.ndarray:
     M[:, :3, 3] = pos
     M[:, 3, 3] = 1.0
     return M
+
+
+UP_AXIS = np.array([0.0, 0.0, 1.0])
 
 
 def _translation(delta: np.ndarray) -> np.ndarray:
@@ -416,7 +423,10 @@ def solve(rig, pins: list[s4.KinematicPin], settings: SolveSettings | None = Non
             kw.update(sole=sole_scaled[k], forward_local=fwd, rest_quat=rest_q,
                       sole_radius=limb.sole_radius * scale, up_local=limb.up_local)
         p, q, w, planted, rep = s4.apply_pins(k, L["pos"], L["quat"], pins, **kw)
+        # How far the pins raise the foot out of the floor: the floor pass decides who pays for it.
+        L["pin_up"] = np.maximum(p[:, 2] - L["pos"][:, 2], 0.0) if limb.kind == "leg" else np.zeros(T)
         L["pos"], L["quat"], L["pin_w"], L["planted"] = p, q, w, planted
+        L["by_hand"] = s4.planted_weight(k, pins, f0, T, auto=False)
         res.warnings += rep
         res.pins_applied += sum(1 for pin in pins if pin.owner == k) - len(rep)
     for pin, far, a, b in gave_way:
@@ -440,21 +450,59 @@ def solve(rig, pins: list[s4.KinematicPin], settings: SolveSettings | None = Non
         return D_E, joint, tip, axis, up
 
     # ---- floor ------------------------------------------------------------------------------------------------
-    def floor_pass():
-        """Lift feet (soles and what the toes cannot absorb) and hands that are below the floor."""
+    def leg_lift(k, tolerated=None):
+        """What the foot of leg ``k`` has to rise by, and how much it is on the ground afterwards (0..1)."""
+        L = limbs[k]
+        limb = L["limb"]
+        pts = sole_world(k)
+        if st.clip_toes and limb.org_toe and smp.has(limb.org_toe):
+            # Toes bend up to stay on the floor (toe pass below). What they cannot absorb -
+            # a foot standing on its tip - lifts the whole foot.
+            _d, joint, tip, axis, up = toe_geometry(L)
+            best, usable = toe_reach_height(joint, tip, axis, up)
+            virtual = tip.copy()
+            virtual[:, 2] = np.where(usable >= 0.5, best, tip[:, 2] + 1e3 * unit)
+            pts = np.concatenate([pts, virtual[:, None, :]], axis=1)
+        if tolerated is not None:
+            pts = pts + tolerated[:, None, None] * UP_AXIS
+        lift = s4.floor_lift(pts, floor, st.floor_cushion, hold=L["planted"], fast=0.15 * unit / fps)
+        height = (pts[..., 2] - floor.height(pts)).min(axis=1) + lift
+        return lift, np.exp(-((np.maximum(height, 0.0) / (0.03 * unit)) ** 2))
+
+    def floor_pass(first=True):
+        """Lift feet (soles and what the toes cannot absorb) and hands that are below the floor.
+
+        ``first``: under a straight leg the body goes up with the foot (``body_lift``). Bending the
+        knee is the last resort: a straight leg shows it far more than the error it removes.
+        """
+        nonlocal D_torso
+        leg_keys = [k for k, L in limbs.items() if L["limb"].kind == "leg" and len(L["limb"].sole_points)]
+        if not first:
+            lifts = {k: leg_lift(k, limbs[k].get("floor_give")) for k in leg_keys}
+        else:
+            lifts = {k: leg_lift(k) for k in leg_keys}
+        if first and st.use_knee_fix and leg_keys:
+            bones = {k: (limbs[k]["limb"].upper_len, limbs[k]["limb"].lower_len) for k in leg_keys}
+            total = {k: lifts[k][0] + limbs[k]["pin_up"] for k in leg_keys}
+            before = {k: limbs[k]["pos"] - limbs[k]["pin_up"][:, None] * UP_AXIS for k in leg_keys}
+            if st.use_pelvis and any(np.any(v > 1e-6 * unit) for v in total.values()):
+                up_by = s5.body_lift({k: limbs[k]["root"] for k in leg_keys}, before, total,
+                                     {k: limbs[k]["raw_reach"] for k in leg_keys}, bones,
+                                     {k: v[1] for k, v in lifts.items()}, smooth_radius=st.pelvis_smooth)
+                if float(up_by.max()) > 1e-6 * unit:
+                    delta = up_by[:, None] * UP_AXIS
+                    D_torso = _translation(delta) @ D_torso
+                    for k, L in limbs.items():
+                        L["root"] = L["root"] + delta
+                        # A foot in the air goes along with the body, a foot on the ground stays where it is.
+                        along = np.where(L["follows"], 1.0, (1.0 - lifts[k][1]) if k in lifts else 0.0)
+                        L["pos"] = L["pos"] + along[:, None] * delta
+                    res.max_body_lift = max(res.max_body_lift, float(up_by.max()))
+                    lifts = {k: leg_lift(k) for k in leg_keys}
         for k, L in limbs.items():
             limb = L["limb"]
-            if limb.kind == "leg" and len(limb.sole_points):
-                pts = sole_world(k)
-                if st.clip_toes and limb.org_toe and smp.has(limb.org_toe):
-                    # Toes bend up to stay on the floor (toe pass below). What they cannot absorb -
-                    # a foot standing on its tip - lifts the whole foot.
-                    _d, joint, tip, axis, up = toe_geometry(L)
-                    best, usable = toe_reach_height(joint, tip, axis, up)
-                    virtual = tip.copy()
-                    virtual[:, 2] = np.where(usable >= 0.5, best, tip[:, 2] + 1e3 * unit)
-                    pts = np.concatenate([pts, virtual[:, None, :]], axis=1)
-                lift = s4.floor_lift(pts, floor, st.floor_cushion, hold=L["planted"])
+            if k in lifts:
+                lift = lifts[k][0]
             elif limb.kind == "arm" and st.clip_hands:
                 lift = s4.floor_lift(L["pos"][:, None, :], floor, st.floor_cushion, clearance=0.5 * limb.end_radius,
                                      hold=L["planted"])
@@ -469,6 +517,8 @@ def solve(rig, pins: list[s4.KinematicPin], settings: SolveSettings | None = Non
                 L["floor_lift"] = L.get("floor_lift", 0.0) + lift
                 res.max_floor_lift = max(res.max_floor_lift, float(np.max(L["floor_lift"])))
 
+    for L in limbs.values():
+        L["raw_reach"] = np.linalg.norm(L["pos0"] - L["root0"], axis=1)      # the reach the take has
     if st.use_floor:
         floor_pass()
 
@@ -476,8 +526,30 @@ def solve(rig, pins: list[s4.KinematicPin], settings: SolveSettings | None = Non
     # ---- knees / elbows -------------------------------------------------------------------------------------------
     if st.use_knee_fix:
         legs = {k: L for k, L in limbs.items() if L["limb"].kind == "leg"}
+        for k, L in legs.items():
+            # What is left of the corrections on a straight leg - a pin that holds the foot while the
+            # hips jitter, a foot lifted out of the floor - gives way by millimetres rather than
+            # moving the knee by centimetres (``reach_give``). Not under a pin made by hand.
+            v = L["pos"] - L["root"]
+            d_now = np.linalg.norm(v, axis=1)
+            most = 0.002 * unit * (1.0 - np.clip(L.get("by_hand", 0.0), 0.0, 1.0)) * np.ones(T)
+            give = s5.reach_give(d_now, np.minimum(L["raw_reach"], L["length"]), L["length"], most)
+            step = (give / np.maximum(d_now, 1e-9))[:, None] * v
+            L["pos"] = L["pos"] + step
+            L["floor_give"] = np.maximum(-step[:, 2], 0.0)
+            res.max_floor_give = max(res.max_floor_give, float(L["floor_give"].max()))
         for L in limbs.values():
-            L["reach"] = s5.reach_targets(L["root"], L["pos"], L["length"], st.max_extension, st.softness)
+            # The reach the take has is the reference: only what the edits add, a target the limb
+            # cannot get to, and real pops are limited (see ``reach_targets``).
+            raw = L["raw_reach"]
+            L["soften"] = s5.pop_windows(L["root0"], L["mid0"], L["W_end"][:, :3, 3], fps)
+            L["reach"] = s5.reach_targets(L["root"], L["pos"], L["length"], st.max_extension, st.softness,
+                                          raw=raw, soften=L["soften"])
+            # The hips give way for a leg whose target is out of reach in the take itself, for a pop
+            # and for a pin made by hand. Not for a detected plant: it corrects the foot, it does not
+            # get to move the body.
+            out_of_reach = np.clip((raw / max(L["length"], 1e-9) - 1.0) / 0.004, 0.0, 1.0)
+            L["give"] = np.maximum(L.get("by_hand", 0.0), L["planted"] * np.maximum(out_of_reach, L["soften"]))
         if st.use_heel_peel:
             for k, L in legs.items():
                 limb = L["limb"]
@@ -490,7 +562,7 @@ def solve(rig, pins: list[s4.KinematicPin], settings: SolveSettings | None = Non
         if st.use_pelvis and legs:
             delta = s5.pelvis_accommodation(
                 {k: L["root"] for k, L in legs.items()}, {k: L["pos"] for k, L in legs.items()},
-                {k: L["reach"] for k, L in legs.items()}, {k: L["planted"] for k, L in legs.items()},
+                {k: L["reach"] for k, L in legs.items()}, {k: L["give"] for k, L in legs.items()},
                 max_drop=st.pelvis_max_drop * unit, smooth_radius=st.pelvis_smooth,
                 allow_horizontal=st.pelvis_horizontal)
             if np.any(np.abs(delta) > 1e-8):
@@ -505,14 +577,18 @@ def solve(rig, pins: list[s4.KinematicPin], settings: SolveSettings | None = Non
                 continue
             # Only where IK is (or will be) active: an FK limb cannot pop from IK over-extension.
             ik_weight = np.maximum(L["ikmode"].astype(np.float64), L["pin_w"])
-            # A pinned limb end is where the user wants it: it only gives way at the hard limit.
+            # A limb end pinned by hand is where the user wants it: it only gives way at the hard
+            # limit. A detected plant does not get to straighten a leg further than the take does:
+            # at push-off the hips move on, and a foot held back 2 cm had the knee fully stretched two
+            # frames early - a snap. There the foot gives way (heel first, see the heel peel above).
             d_now = np.linalg.norm(L["pos"] - L["root"], axis=1)
             hard = np.minimum(d_now, st.max_extension * L["length"])
-            target = L["reach"] + L["pin_w"] * (np.maximum(hard, L["reach"]) - L["reach"])
+            firm = L.get("by_hand", np.zeros(T)) if L["limb"].kind == "leg" else L["pin_w"]
+            target = L["reach"] + firm * (np.maximum(hard, L["reach"]) - L["reach"])
             new_pos = s5.soft_ik(L["root"], L["pos"], target, weight=ik_weight)
             shift = np.linalg.norm(new_pos - L["pos"], axis=1)
             res.softik_frames += int(np.count_nonzero(shift > 1e-5 * unit))
-            gave_way = (L["pin_w"] > 0.99) & (shift > 0.002 * unit)
+            gave_way = (L.get("by_hand", np.zeros(T)) > 0.99) & (shift > 0.002 * unit)
             if gave_way.any():
                 runs = find_runs(gave_way)
                 res.warnings.append(
@@ -521,7 +597,7 @@ def solve(rig, pins: list[s4.KinematicPin], settings: SolveSettings | None = Non
             L["pos"] = new_pos
         if st.use_floor:
             # The pelvis takes FK limbs down with it: whatever it pushed into the floor comes up again.
-            floor_pass()
+            floor_pass(first=False)
 
     # ---- body capsules ----------------------------------------------------------------------------------------------
     if st.use_capsules:

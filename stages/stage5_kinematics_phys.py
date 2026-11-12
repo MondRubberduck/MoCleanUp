@@ -52,14 +52,64 @@ def pop_score(root: np.ndarray, end: np.ndarray, upper_len: float, lower_len: fl
 
 
 def reach_targets(root: np.ndarray, end: np.ndarray, length: float, r_max: float = 0.995,
-                  softness: float = 0.03) -> np.ndarray:
-    """Allowed root-end distance ``(T,)`` for a limb: the soft-clamped version of its current reach.
+                  softness: float = 0.03, raw: np.ndarray | None = None, soften: np.ndarray | None = None) -> np.ndarray:
+    """Allowed root-end distance ``(T,)`` for a limb.
 
-    Computed once from the uncorrected motion; the tiers below (heel peel, pelvis, soft IK) then
-    share the work of bringing the limb down to this distance, so the clamp is never applied twice.
+    Without ``raw``: the soft-clamped version of the current reach, on every frame.
+
+    With ``raw`` (the reach the take itself has, ``(T,)``): the take's own reach is not ours to
+    change. A leg that stands straight in the data stays straight - soft-clamping it would bend the
+    knees and lower the hips on every standing frame. Limited is only what goes beyond the data:
+
+    * what an edit adds (a pin or the floor moved the limb end away from the root): up to the reach
+      of the data, or the soft clamp, whichever is more
+    * a target the limb cannot get to (``raw`` above ``length``): back onto the reach of the limb
+    * ``soften (T,)`` in 0..1: frames where the hinge really snaps (``pop_windows``) get the soft
+      clamp after all
+
+    Computed once; the tiers below (heel peel, pelvis, soft IK) then share the work of bringing the
+    limb down to this distance, so the clamp is never applied twice.
     """
     d = np.linalg.norm(end - root, axis=-1)
-    return soft_reach(d / max(length, 1e-9), r_max, softness) * length
+    soft = soft_reach(d / max(length, 1e-9), r_max, softness) * length
+    if raw is None:
+        return soft
+    keep = np.minimum(d, np.maximum(np.minimum(raw, length), soft))
+    if soften is not None:
+        keep = keep + np.clip(soften, 0.0, 1.0) * (soft - keep)
+    return keep
+
+
+def hinge_flexion(root: np.ndarray, mid: np.ndarray, end: np.ndarray) -> np.ndarray:
+    """Flexion ``(T,)`` of the middle joint in radians (0 = straight)."""
+    u, l = mid - root, end - mid
+    cos = np.sum(u * l, axis=1) / np.maximum(np.linalg.norm(u, axis=1) * np.linalg.norm(l, axis=1), 1e-12)
+    return np.arccos(np.clip(cos, -1.0, 1.0))
+
+
+def pop_frames(root: np.ndarray, mid: np.ndarray, end: np.ndarray, fps: float, threshold: float = 180.0,
+               straight: float = np.radians(15.0)):
+    """Frames where the middle joint of a limb snaps at full extension: ``(mask (T,), acceleration (T,))``.
+
+    A pop is angular acceleration of the hinge above ``threshold`` (rad/s^2; a normal walk stays
+    around 130) while the limb is within ``straight`` of fully stretched.
+    """
+    flex = hinge_flexion(root, mid, end)
+    T = len(flex)
+    acc = np.zeros(T)
+    if T >= 3:
+        acc[1:-1] = np.abs(flex[2:] - 2.0 * flex[1:-1] + flex[:-2]) * fps * fps
+    near = np.minimum(flex, np.minimum(np.roll(flex, 1), np.roll(flex, -1))) < straight
+    return (acc > threshold) & near, acc
+
+
+def pop_windows(root: np.ndarray, mid: np.ndarray, end: np.ndarray, fps: float, threshold: float = 180.0,
+                window: float = 0.25) -> np.ndarray:
+    """Weight ``(T,)`` in 0..1 around the pops of a limb (``pop_frames``), ``window`` seconds to either side."""
+    pop, _acc = pop_frames(root, mid, end, fps, threshold)
+    if not pop.any():
+        return np.zeros(len(pop))
+    return np.clip(upper_envelope(pop.astype(np.float64), max(2, int(round(window * fps)))), 0.0, 1.0)
 
 
 def pelvis_accommodation(hips: dict[str, np.ndarray], ankles: dict[str, np.ndarray], targets: dict[str, np.ndarray],
@@ -106,6 +156,71 @@ def pelvis_accommodation(hips: dict[str, np.ndarray], ankles: dict[str, np.ndarr
             scale = np.minimum(1.0, max_drop / np.maximum(mag, 1e-12))
             delta += smooth_hann(shift * scale[:, None], smooth_radius)
     return delta
+
+
+def knee_offset(d: np.ndarray, upper: float, lower: float) -> np.ndarray:
+    """How far the middle joint of a two-bone limb sits off the root-end line when the ends are ``d`` apart."""
+    d = np.clip(d, 1e-9, upper + lower)
+    x = (d * d + upper * upper - lower * lower) / (2.0 * d)
+    return np.sqrt(np.clip(upper * upper - x * x, 0.0, None))
+
+
+def body_lift(roots: dict[str, np.ndarray], ends: dict[str, np.ndarray], lifts: dict[str, np.ndarray],
+              d_ref: dict[str, np.ndarray], bones: dict[str, tuple[float, float]], ground: dict[str, np.ndarray],
+              smooth_radius: int = 3, body_weight: float = 2.0, steps: int = 13) -> np.ndarray:
+    """How far to raise the body ``(T,)`` when feet are lifted out of the floor.
+
+    A foot 6 mm below the floor under a straight leg: lifting the foot alone bends the knee by 13
+    degrees and moves it 5 cm - far more visible than the error it removes. With a straight leg the
+    foot is too low because the hips are; so the hips go up, and the leg stays as it is.
+
+    ``ends``: the feet before they are lifted, ``lifts``: what each has to rise by, ``d_ref``: the
+    root-end distance each leg should keep. ``ground`` (0..1): how much a foot is on the ground; a
+    foot in the air goes along with the body. Per frame the lift between 0 and the largest foot lift
+    is taken that moves the knees least. Two feet on the ground rarely want the same: the straighter
+    leg wins, because its knee moves most. Moving the whole body counts too (``body_weight``): a bent
+    leg takes most of its lift itself. Never more than the feet are lifted by.
+    """
+    keys = [k for k in roots if k in lifts]
+    T = len(next(iter(roots.values())))
+    if not keys:
+        return np.zeros(T)
+    top = np.max([lifts[k] * ground[k] for k in keys], axis=0)
+    if not np.any(top > 0.0):
+        return np.zeros(T)
+    cand = top[:, None] * np.linspace(0.0, 1.0, steps)[None, :]                       # (T, S)
+    cost = (body_weight * cand) ** 2
+    for k in keys:
+        upper, lower = bones[k]
+        v = ends[k] - roots[k]
+        flat2 = (v[:, 0] ** 2 + v[:, 1] ** 2)[:, None]
+        foot_up = np.maximum(lifts[k][:, None], (1.0 - ground[k])[:, None] * cand)
+        d = np.sqrt(flat2 + (v[:, 2:3] + foot_up - cand) ** 2)
+        keep = knee_offset(d_ref[k], upper, lower)[:, None]
+        cost = cost + (knee_offset(d, upper, lower) - keep) ** 2 + (10.0 * np.maximum(d - (upper + lower), 0.0)) ** 2
+    best = cand[np.arange(T), np.argmin(cost, axis=1)]
+    return np.clip(smooth_hann(best, smooth_radius), 0.0, None) if smooth_radius > 0 else best
+
+
+def reach_give(d_now: np.ndarray, d_ref: np.ndarray, length: float, most,
+               straight: tuple[float, float] = (0.986, 0.9965)) -> np.ndarray:
+    """How far a limb end should give way along the limb ``(T,)`` to spare the middle joint (+ = away from the root).
+
+    The knee of a straight leg moves with the square root of what its foot is moved by: 1 mm closer
+    to the hip bends it 2 cm sideways, 6 mm 5 cm. So on a straight leg a correction of millimetres -
+    a pin holding the foot while the hips jitter, a foot lifted out of the floor - shows as a snap of
+    the knee that is far more visible than the error it removes. A bent leg takes the same
+    correction without showing it.
+
+    ``d_now``: root-end distance after the corrections, ``d_ref``: the one the take has. Where the
+    take has the leg straight (``straight``: reach ratios between which the rule fades in; there the
+    knee moves 3 and 6 times as far as the foot) the foot gives way until the leg has the length of
+    the take again, but never by more than ``most`` (scalar or ``(T,)``).
+    """
+    lo, hi = straight
+    u = np.clip((np.asarray(d_ref) / max(length, 1e-9) - lo) / (hi - lo), 0.0, 1.0)
+    gate = u * u * (3.0 - 2.0 * u)
+    return gate * np.clip(d_ref - d_now, -np.asarray(most), np.asarray(most))
 
 
 def soft_ik(root: np.ndarray, end: np.ndarray, target: np.ndarray, weight: np.ndarray | None = None) -> np.ndarray:

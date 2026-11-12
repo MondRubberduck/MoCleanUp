@@ -40,6 +40,7 @@ from ..core.math_quat import (
 )
 from ..core.rig_inspector import commanded_end, inspect_rig, sole_contacts, solver_bone_names
 from . import stage4_contacts_pins as s4
+from . import stage5_kinematics_phys as s5
 from .stage2_filters import estimate_cutoff, scene_fps
 
 ISSUE_LABELS = {
@@ -263,7 +264,7 @@ def outlier_scores(x: np.ndarray, floor: float, spike_z: float = 6.5, max_spike_
 # ---------------------------------------------------------------------------
 
 def analyze(rig, *, bone_names: list[str] | None = None, floor_z: float = 0.0, floor_object=None,
-            spike_z: float = 6.5, jitter_z: float = 3.5, hyperext: float = 0.985, pop_threshold: float = 180.0,
+            spike_z: float = 6.5, jitter_z: float = 3.5, hyperext: float = 1.002, pop_threshold: float = 180.0,
             skate_tol: float = 0.012, penetration_tol: float = 0.006, check_world: bool = True,
             max_issues: int = 600, auto_floor: bool = False, pins: list | None = None) -> DiagnosticReport:
     """Scan the active action of ``rig``. Tolerances are metres for a 1.75 m character.
@@ -511,18 +512,14 @@ def _world_checks(rig, profile, report, f0, f1, fps, floor_z, floor_object, hype
         target = np.where((ikfk < 0.5)[:, None], aim if aim is not None else smp.head_w(limb.ik_ctrl), end)
         reach = np.linalg.norm(target - root, axis=1) / max(limb.max_reach, 1e-9)
         name = ("Left " if limb.side == "L" else "Right ") + limb.kind
-        over = (reach > hyperext) & (ikfk < 0.5)           # a straight FK limb is a pose, not an IK that runs out of reach
+        # Over-extended: the IK target is further away than the limb is long. A limb that is merely
+        # straight is a pose (retargeted legs stand at 0.997-1.000 all the time), in IK as in FK.
+        over = (reach > hyperext) & (ikfk < 0.5)
         for s, e in find_runs(over):
             r = float(reach[s : e + 1].max())
             issues.append(Issue("HYPEREXT", f0 + s, f0 + e, limb.ik_ctrl, float(np.clip(0.35 + 8.0 * (r - hyperext), 0.35, 0.9)),
                                 f"{name} over-extended (reach {r:.3f})"))
-        u, l = mid - root, end - mid
-        cosang = np.sum(u * l, axis=1) / np.maximum(np.linalg.norm(u, axis=1) * np.linalg.norm(l, axis=1), 1e-12)
-        flex = np.arccos(np.clip(cosang, -1.0, 1.0))
-        acc = np.zeros(T)
-        acc[1:-1] = np.abs(flex[2:] - 2.0 * flex[1:-1] + flex[:-2]) * fps * fps
-        near_straight = np.minimum(flex, np.minimum(np.roll(flex, 1), np.roll(flex, -1))) < np.radians(15.0)
-        pop = (acc > pop_threshold) & near_straight
+        pop, acc = s5.pop_frames(root, mid, end, fps, pop_threshold)
         joint = "knee" if limb.kind == "leg" else "elbow"
         for s, e in find_runs(close_small_gaps(pop, 1)):
             a = float(acc[s : e + 1].max())

@@ -559,7 +559,8 @@ def test_frames_between_ik_and_fk_are_left_alone():
     knee = np.linalg.norm(out.head_w(leg.org_lower) - knee0, axis=1)
     print(f"   blended frame: foot {gap * 100:.1f} cm from its IK control; after the solve the foot moved {moved[blend] * 1000:.2f} mm, "
           f"the knee {knee[blend] * 1000:.2f} mm | {res.summary()}")
-    assert res.floor_frames > 0 and sole_world(profile, out, "L")[..., 2].min() > -5e-4      # the dip is fixed
+    # the dip is fixed (a straight leg may leave 2 mm in the floor rather than snap its knee: ``reach_give``)
+    assert res.floor_frames > 0 and sole_world(profile, out, "L")[..., 2].min() > -0.0025
     assert moved[blend] < 0.001 and knee[blend] < 0.001, (moved[blend], knee[blend])        # the blended frame is not touched
     assert moved[blend + 1 :].max() < 0.001 and knee[blend + 1 :].max() < 0.001             # nor the FK frames
     assert np.array_equal(action_io.read_bone_prop_curve(rig, "thigh_parent.L", "IK_FK", f0, f1), switch)
@@ -660,7 +661,7 @@ def test_a_leg_switched_to_ik_takes_its_toes_along():
     print(f"   FK foot pitched 29 deg into the floor: toe tip {tip0[:, 2].min() * 100:.1f} cm -> {tip1[:, 2].min() * 100:.2f} cm "
           f"(at the deepest frame {tip1[30, 2] * 1000:.1f} mm), sole {sole1[..., 2].min() * 1000:.1f} mm | {res.summary()}")
     assert switch[30] < 0.01 and switch[3] > 0.99 and switch[-3] > 0.99                 # IK for the fix only
-    assert tip1[:, 2].min() > -0.002 and sole1[..., 2].min() > -0.002                   # nothing is left in the floor
+    assert tip1[:, 2].min() > -0.002 and sole1[..., 2].min() > -0.003                   # nothing is left in the floor (2 mm give)
     assert abs(tip1[30, 2]) < 0.004                                                     # and the toes lie on it, not in the air
     assert np.abs(tip1[:10] - tip0[:10]).max() < 0.001 and np.abs(tip1[-10:] - tip0[-10:]).max() < 0.001
 

@@ -213,8 +213,9 @@ class MCSettings(PropertyGroup):
                                      description="How far an outlier must stick out of its neighbourhood (lower = more spikes)")
     jitter_sensitivity: FloatProperty(name="Jitter Threshold", default=3.5, min=1.5, max=5.5,
                                       description="Noise level relative to the take that is marked as jitter")
-    hyperext_ratio: FloatProperty(name="Reach Limit", default=0.985, min=0.9, max=1.0, precision=3,
-                                  description="Limb extension above which a frame is marked")
+    hyperext_ratio: FloatProperty(name="Reach Limit", default=1.002, min=0.9, max=1.1, precision=3,
+                                  description="An IK target further away than this many limb lengths is marked: "
+                                              "the limb cannot get there. (A limb that is merely straight is a pose)")
     repair_flips: BoolProperty(name="Flips", default=True)
     repair_spikes: BoolProperty(name="Spikes", default=True)
     repair_frozen: BoolProperty(name="Dropouts", default=True)
@@ -261,7 +262,9 @@ class MCSettings(PropertyGroup):
                                  description="How far a detected plant may move a foot along the floor. A foot that would "
                                              "have to be carried further was not planted: the pin gives way there and says "
                                              "so. Pins you make yourself hold whatever it takes (0 = no limit)")
-    contact_min_time: FloatProperty(name="Min Duration", default=0.1, min=0.03, max=1.0, unit="TIME_ABSOLUTE")
+    contact_min_time: FloatProperty(name="Min Duration", default=0.17, min=0.03, max=1.0, unit="TIME_ABSOLUTE",
+                                    description="A plant holds at least this long. Shorter stops are turning points "
+                                                "(the bottom of a landing, the end of a kick), not plants")
     contact_hands: BoolProperty(name="Hands", default=False, description="Also detect hands resting on the floor")
     pin_blend_in: IntProperty(name="Ease In", default=4, min=0, max=60)
     pin_blend_out: IntProperty(name="Ease Out", default=5, min=0, max=60)
