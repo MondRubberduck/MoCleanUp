@@ -333,7 +333,7 @@ class MOCAP_OT_restore_raw(_MocapOperator):
         whole = fs is None and bones is None and self.factor >= 1.0
         resolve = solver.unbake_for_edit(rig)
         n = raw_snapshot.restore_region_to_raw(rig, fs, fe, self.factor, st.restore_blend, bones)
-        common.end_edit(context, rig, resolve and not whole)
+        common.end_edit(context, rig, resolve and not whole, sync=not whole)      # the whole take: exactly as it was
         return f"Restored {n} curves" + ("" if not whole else " (pins are kept; press Solve to apply them again)")
 
 
@@ -352,6 +352,7 @@ class MOCAP_OT_snapshot(_MocapOperator):
             if s6.has_residual(rig):
                 raise MocapError("Merge the residual detail layer first")
             raw_snapshot.ensure_raw_snapshot(rig, force_overwrite=True)
+            common.remember_chains(rig)
             return "The current animation is the new raw reference"
         return "Raw snapshot deleted" if raw_snapshot.delete_raw_snapshot(rig) else "There was no raw snapshot"
 

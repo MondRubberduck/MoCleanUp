@@ -201,6 +201,24 @@ def sample_objects(requests: list[tuple[object, list[str] | None]], f0: int, f1:
     return {obj.name: RigSample(obj.name, f0, f1, names, pose, ow) for obj, names, idx, buf, pose, ow in entries}
 
 
+def sample_frames(obj, names: list[str], frames, scene=None) -> RigSample:
+    """Evaluated matrices of ``names`` at a few frames (the user's scene is stepped to each).
+
+    Returns a ``RigSample`` whose time axis is the list of frames, in the order given.
+    """
+    scene = scene or bpy.context.scene
+    all_names = [pb.name for pb in obj.pose.bones]
+    lookup = {n: i for i, n in enumerate(all_names)}
+    names = [n for n in dict.fromkeys(names) if n in lookup]
+    idx = np.array([lookup[n] for n in names], dtype=np.int64)
+    buf = np.empty(len(all_names) * 16, dtype=np.float32)
+    frames = [int(f) for f in frames]
+    probes = _sample_scene([(obj, names, idx, buf, None, None)], 0, 0, scene, frames=frames)
+    world = np.stack([probes[f][0][0] for f in frames])
+    pose = np.stack([probes[f][0][1] for f in frames])
+    return RigSample(obj.name, 0, len(frames) - 1, names, pose, world)
+
+
 # ---------------------------------------------------------------------------
 # Pose matrix -> local channels
 # ---------------------------------------------------------------------------

@@ -5,7 +5,7 @@ from __future__ import annotations
 import bpy
 
 from .. import props
-from ..core import action_io, raw_snapshot, runtime
+from ..core import action_io, chain_sync, raw_snapshot, runtime
 from ..core.rig_inspector import inspect_rig
 from ..stages import solver
 from ..stages import stage1_diagnostics as s1
@@ -87,15 +87,37 @@ def begin_edit(rig, upstream: bool = True) -> bool:
     """Call before changing curves. Returns True when the contact solve has to be redone afterwards."""
     if s6.has_residual(rig):
         raise MocapError("The take has a residual detail layer. Merge it first (Keys stage)")
+    first = raw_snapshot.get_raw_snapshot(rig) is None
     raw_snapshot.ensure_raw_snapshot(rig)
+    if first:
+        remember_chains(rig)
     return solver.unbake_for_edit(rig) if upstream else False
 
 
-def end_edit(context, rig, resolve: bool = False) -> None:
+def remember_chains(rig) -> None:
+    """The take as it arrives: which limbs have their IK and FK chain in agreement (``chain_sync``)."""
+    profile = profile_of(rig)
+    if profile.is_supported:
+        chain_sync.remember(rig, profile)
+
+
+def sync_chains(rig) -> list[str]:
+    """After an edit: the FK chains of those limbs follow the result. Never fails an edit that is done."""
+    try:
+        profile = profile_of(rig)
+        return chain_sync.sync(rig, profile) if profile.is_supported else []
+    except Exception as exc:
+        print(f"MoCap Cleanup: could not re-sync the FK chains ({exc})")
+        return []
+
+
+def end_edit(context, rig, resolve: bool = False, sync: bool = True) -> None:
     data = rig.mocap_cleanup
     data.analysis_stale = True
     if resolve:
         run_solve(context, rig)
+    if sync:
+        sync_chains(rig)                   # (nothing to do when the solve just did it)
     rig.update_tag()
     scene = context.scene
     scene.frame_set(scene.frame_current)
@@ -110,6 +132,7 @@ def run_solve(context, rig, use_cache: bool = True):
     res = solver.solve(rig, data.pin_data(), props.solve_settings(st, scene_fps(context.scene)), use_cache=use_cache)
     data.last_result = res.summary()
     data.analysis_stale = True
+    sync_chains(rig)
     tag_redraw()
     return res
 

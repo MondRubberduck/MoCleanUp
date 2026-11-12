@@ -769,6 +769,59 @@ def test_a_planted_foot_turns_on_its_ball():
     assert np.ptp(head) < 0.01, np.ptp(head)
 
 
+# ---- the chain that is not active follows --------------------------------------------------------------------------
+# Rig Bridge keys the IK and the FK chain of every limb. The cleanup edited the active one: afterwards
+# the two were 2-4 cm apart on a real take (QA I1), and the limb jumped when IK/FK was switched.
+
+def test_the_fk_chain_follows_the_cleanup():
+    import harm
+    from mocap_cleanup.core import chain_sync, raw_snapshot
+    from mocap_cleanup.core.rig_inspector import inspect_rig
+    rig, gt, st = ta.make_scene()
+    # a walk on the IK controls, with footskate; short strides on bent legs, so that the feet stay
+    # within reach (beyond it Rigify stretches the IK chain, and no FK chain can follow that)
+    for pb in rig.pose.bones:
+        pb.ik_stretch = 0.0            # as Rig Bridge does: stock Rigify shrinks its IK chain by 2 %, and no FK chain agrees with that
+    gt = synth_walk(rig, n_frames=gt["T"], stride=0.6, drop=0.12)
+    corrupt_feet(rig, gt)
+    scene = bpy.context.scene
+    profile = inspect_rig(rig)
+    T = gt["T"]
+    # make the take arrive as a bake of both chains: key the FK controls onto the IK motion
+    ident = np.tile([1.0, 0.0, 0.0, 0.0], (T, 1))
+    for limb in profile.limbs():
+        for fk, _org in chain_sync.fk_chain(rig, limb):
+            action_io.write_bone_local_channels(rig, fk, gt["f0"], quat=ident)
+    snap = raw_snapshot.ensure_raw_snapshot(rig)
+    snap[chain_sync.SYNC_KEY] = ",".join(l.key for l in profile.legs.values())
+    assert chain_sync.sync(rig, profile), "nothing was written"
+    assert raw_snapshot.delete_raw_snapshot(rig)
+    frames = np.arange(gt["f0"], gt["f1"] + 1, 3)
+
+    def apart():
+        gaps = harm.chain_agreement(scene, rig, profile, list(action_io.iter_fcurves(rig)), frames)
+        return max(float(gaps[l.key].max()) for l in profile.legs.values())
+
+    before = apart()
+    assert before < 0.0005, before                                  # the fixture: both chains agree
+    crc = action_io.action_checksum(rig)
+    assert bpy.ops.mocap.run_all() == {"FINISHED"}
+    assert chain_sync.came_in_sync(rig) >= {l.key for l in profile.legs.values()}, chain_sync.came_in_sync(rig)
+    after = apart()
+    moved = float(np.abs(action_io.read_bone_local_channels(rig, "foot_ik.L", gt["f0"], gt["f1"])["loc"]
+                         - gt["feet"]["L"][0]).max())
+    print(f"   one click moved the IK foot control by up to {moved * 100:.1f} cm; IK and FK chain apart: "
+          f"{before * 1000:.2f} mm before, {after * 1000:.2f} mm after")
+    assert after < 0.002, after                                     # without the sync: centimetres
+    # a limb whose chains did not agree to begin with is somebody's work: it is left alone
+    fk0 = action_io.read_bone_local_channels(rig, "upper_arm_fk.L", gt["f0"], gt["f1"])["quat"].copy()
+    assert not any(k.startswith("arm") for k in chain_sync.came_in_sync(rig))
+    assert np.array_equal(fk0, action_io.read_bone_local_channels(rig, "upper_arm_fk.L", gt["f0"], gt["f1"])["quat"])
+    # and the whole take comes back exactly
+    assert bpy.ops.mocap.restore_raw() == {"FINISHED"}
+    assert action_io.action_checksum(rig) == crc
+
+
 def test_unexpected_errors_are_reported_not_swallowed():
     rig, gt, st = ta.make_scene(n_frames=70)
     original = operators.common.run_analyze
@@ -807,5 +860,5 @@ if __name__ == "__main__":
                test_a_kick_is_not_a_pole_whip, test_one_click_rebuilds_only_spikes_beyond_doubt,
                test_a_leg_switched_to_ik_takes_its_toes_along, test_a_slow_step_is_not_a_plant,
                test_a_contact_is_cut_where_the_foot_travels, test_a_detected_pin_gives_way,
-               test_a_planted_foot_turns_on_its_ball,
+               test_a_planted_foot_turns_on_its_ball, test_the_fk_chain_follows_the_cleanup,
                test_unexpected_errors_are_reported_not_swallowed])
