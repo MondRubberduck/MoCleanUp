@@ -68,16 +68,19 @@ class _MocapOperator(Operator):
 class MOCAP_OT_use_active_rig(_MocapOperator):
     bl_idname = "mocap.use_active_rig"
     bl_label = "Use Active"
-    bl_description = "Work on the active armature"
+    bl_description = "Work on the active armature (for a character mesh or a skeleton under a control rig: the rig)"
 
     @classmethod
     def poll(cls, context):
-        ob = context.active_object
-        return ob is not None and ob.type == "ARMATURE"
+        return common.resolve_rig(context.active_object) is not None
 
     def run(self, context):
-        context.scene.mocap_cleanup.rig = context.active_object
-        return f"Working on '{context.active_object.name}'"
+        ob = context.active_object
+        rig = common.resolve_rig(ob) or ob
+        context.scene.mocap_cleanup.rig = rig
+        if rig != ob:
+            return f"Working on '{rig.name}', the control rig that drives '{ob.name}'"
+        return f"Working on '{rig.name}'"
 
 
 PRESETS = {
@@ -230,15 +233,23 @@ class MOCAP_OT_issue_fix(_MocapOperator):
         st = context.scene.mocap_cleanup
         data = rig.mocap_cleanup
         issue = data.issues[data.active_issue]
-        kind, a, b, bone = issue.kind, issue.frame_start, issue.frame_end, issue.bone
+        kind, a, b, bone, text = issue.kind, issue.frame_start, issue.frame_end, issue.bone, issue.message
         tool = s1.ISSUE_FIX.get(kind, "")
         bones = [bone] if bone else None
         if tool == "REPAIR":
+            crc = action_io.action_checksum(rig)
             resolve = common.begin_edit(rig)
             report = common.fresh_report(context, rig)
             s1.repair(rig, report, frame_start=a, frame_end=b, bone_names=bones)
             common.end_edit(context, rig, resolve)
-            msg = f"Repaired {issue.message}"
+            if action_io.action_checksum(rig) == crc:
+                common.run_analyze(context, rig)
+                raise MocapError(f"Could not repair {text}: nothing there to rebuild (a lasting step in the take, "
+                                 "not a one-frame glitch). Key it by hand or leave it")
+            common.run_analyze(context, rig)
+            still = any(i.kind == kind and i.bone == bone and i.frame_start <= b and i.frame_end >= a for i in data.issues)
+            return (f"Repair changed the curves, but '{text}' is still flagged" if still
+                    else f"Repaired {text}")
         elif tool == "FILTER":
             resolve = common.begin_edit(rig)
             s2.filter_action(rig, st.filter_method, st.cutoff_hz, bone_names=bones, frame_start=a, frame_end=b,
@@ -556,6 +567,8 @@ class MOCAP_OT_pin_add(_MocapOperator):
 
     def run(self, context):
         rig = common.require_rig(context, need_rigify=True)
+        if s6.has_residual(rig):
+            raise MocapError("The take has a residual detail layer. Merge it first (Keys stage)")
         st = context.scene.mocap_cleanup
         data = rig.mocap_cleanup
         profile = common.profile_of(rig)

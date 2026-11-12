@@ -263,6 +263,33 @@ def outlier_scores(x: np.ndarray, floor: float, spike_z: float = 6.5, max_spike_
 # Analysis
 # ---------------------------------------------------------------------------
 
+def inactive_controls(rig, profile, f0: int, f1: int) -> set[str]:
+    """Controls of a chain that has no influence anywhere in the take: the IK controls of a limb that is in FK
+    on every frame, the FK controls of one that is in IK on every frame. Their noise is not seen, and the
+    chain sync derives them from the active chain after an edit (QA M5: the leftover issues of a cleaned Rig
+    Bridge take were all on unused IK poles). Only limbs whose chains came in agreeing count: there the idle
+    chain is a copy that the chain sync keeps; elsewhere it is somebody's work and its errors are shown."""
+    from ..core.chain_sync import came_in_sync, fk_chain
+    out: set[str] = set()
+    synced = came_in_sync(rig)
+    if not profile.is_supported or not synced:
+        return out
+    for limb in profile.limbs():
+        if limb.key not in synced:
+            continue
+        sb = limb.switch_bone
+        if not sb or sb not in rig.pose.bones or "IK_FK" not in rig.pose.bones[sb].keys():
+            continue
+        sw = action_io.read_bone_prop_curve(rig, sb, "IK_FK", f0, f1)
+        if float(sw.min()) >= 1.0 - 1e-4:
+            out |= {n for n in (limb.ik_ctrl, limb.pole_ctrl, limb.ik_base_ctrl, limb.heel_ctrl) if n}
+            if limb.toe_ctrl and "ik" in limb.toe_ctrl.lower():
+                out.add(limb.toe_ctrl)
+        elif float(sw.max()) <= 1e-4:
+            out |= {fk for fk, _org in fk_chain(rig, limb)}
+    return out
+
+
 def analyze(rig, *, bone_names: list[str] | None = None, floor_z: float = 0.0, floor_object=None,
             spike_z: float = 6.5, jitter_z: float = 3.5, hyperext: float = 1.002, pop_threshold: float = 180.0,
             skate_tol: float = 0.012, penetration_tol: float = 0.006, check_world: bool = True,
@@ -282,7 +309,8 @@ def analyze(rig, *, bone_names: list[str] | None = None, floor_z: float = 0.0, f
         return report
     profile = inspect_rig(rig)
     unit, scale = profile.unit, max(profile.scale, 1e-9)
-    animated = action_io.get_animated_bone_names(rig)
+    idle = inactive_controls(rig, profile, f0, f1)
+    animated = [b for b in action_io.get_animated_bone_names(rig) if b not in idle]
     if bone_names is not None:
         wanted = set(bone_names)
         animated = [b for b in animated if b in wanted]

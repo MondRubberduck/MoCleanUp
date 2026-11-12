@@ -21,21 +21,45 @@ def get_settings(context=None):
     return (context or bpy.context).scene.mocap_cleanup
 
 
+def driving_rig(arm):
+    """The armature that drives ``arm`` through bone constraints (a game skeleton under a control rig such as
+    Rig Bridge's), else None. Editing the skeleton's own action would change nothing that is seen (QA I4)."""
+    counts = {}
+    for pb in arm.pose.bones:
+        for c in pb.constraints:
+            t = getattr(c, "target", None)
+            if t is not None and t != arm and t.type == "ARMATURE" and not c.mute and c.influence > 0.0:
+                counts[t] = counts.get(t, 0) + 1
+    if not counts:
+        return None
+    t, n = max(counts.items(), key=lambda kv: kv[1])
+    return t if n >= max(3, 0.3 * len(arm.pose.bones)) else None
+
+
+def resolve_rig(ob):
+    """The armature to clean for ``ob``: a mesh's armature, and a constrained skeleton's control rig."""
+    if ob is None:
+        return None
+    if ob.type == "MESH":
+        arm = next((m.object for m in ob.modifiers if m.type == "ARMATURE" and m.object is not None), None)
+        ob = arm or (ob.parent if ob.parent is not None and ob.parent.type == "ARMATURE" else None)
+        if ob is None:
+            return None
+    if ob.type != "ARMATURE":
+        return None
+    return driving_rig(ob) or ob
+
+
 def get_rig(context=None):
-    """The rig to work on: the picked one, else the active armature (or the armature of the active mesh)."""
+    """The rig to work on: the picked one, else the active armature (or the armature of the active mesh).
+    A skeleton driven by a control rig stands for that rig."""
     context = context or bpy.context
     st = context.scene.mocap_cleanup
     rig = st.rig
     if rig is not None and rig.name in context.scene.objects and rig.type == "ARMATURE":
-        return rig
+        return resolve_rig(rig)
     ob = getattr(context, "active_object", None) or context.view_layer.objects.active
-    if ob is None:
-        return None
-    if ob.type == "ARMATURE":
-        return ob
-    if ob.parent is not None and ob.parent.type == "ARMATURE":
-        return ob.parent
-    return None
+    return resolve_rig(ob)
 
 
 def profile_of(rig):
