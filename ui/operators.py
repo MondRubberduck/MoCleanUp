@@ -519,7 +519,7 @@ def _floor_note(dz, k, unit) -> str:
     elif abs(dz) > 0.001 * unit:
         parts.append(f"take {'raised' if dz > 0 else 'lowered'} {abs(dz) * 100:.1f} cm onto the floor")
     if abs(k) > 0.002 * unit:
-        parts.append(f"mesh sole {k * 100:.1f} cm below the rig's")
+        parts.append(f"mesh sole {abs(k) * 100:.1f} cm {'below' if k > 0 else 'above'} the rig's")
     return ", ".join(parts)
 
 
