@@ -290,7 +290,7 @@ if m:
             print(f"  largest change, {name} at frame {frame}: cm off the line between the neighbouring frames, frames {frame - 2}..{frame + 2}: "
                   f"raw {flick(j0)} -> cleaned {flick(j1)}")
 after = harm.take(mods, scene, rig, f0, f1, skin)
-rows, failed = harm.compare(before, after, st.floor_z)
+rows, failed = harm.compare(before, after, st.floor_z, pins=[p.to_data() for p in data.pins])
 print(f"  what it did to the body (floor at {st.floor_z / unit * 100:.1f} cm" + (f", mesh {[m.name for m in skin]}" if skin else ", no character mesh") + "):")
 harm.print_rows(rows)
 

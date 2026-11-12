@@ -170,8 +170,9 @@ def take(mods, scene, rig, f0: int, f1: int, meshes=None, samples: int = 240) ->
     }
 
 
-def compare(before: dict, after: dict, floor_z: float, limits: dict | None = None):
-    """Rows ``(what, before, after, limit, ok)`` and the list of failed checks."""
+def compare(before: dict, after: dict, floor_z: float, limits: dict | None = None, pins=None):
+    """Rows ``(what, before, after, limit, ok)`` and the list of failed checks. ``pins``: the floor pins after
+    the cleanup; where a foot is planted is where the mesh has to rest on the floor."""
     lim = dict(LIMITS, **(limits or {}))
     u, f0 = before["unit"] / 100.0, before["f0"]            # world units per cm of a 1.75 m character
     rows, failed = [], []
@@ -216,9 +217,20 @@ def compare(before: dict, after: dict, floor_z: float, limits: dict | None = Non
         row(f"IK against FK, {key}", f"{b:.2f} cm", f"{a:.2f} cm", f"{lim['chains_cm']} cm" if in_sync else "(was not in sync)",
             bool(a <= lim["chains_cm"]) if in_sync else None)
     if after["mesh_low"] is not None:
-        b = (np.median(before["mesh_low"]) - floor_z) / u
-        a = (np.median(after["mesh_low"]) - floor_z) / u
-        row("Character mesh rests at (floor = 0)", f"{b:+.2f} cm", f"{a:+.2f} cm, lowest {(after['mesh_low'].min() - floor_z) / u:+.2f} cm",
+        # The mesh has to rest on the floor where a foot is planted; in the air or mid-step it is above it,
+        # and a median over every frame of a jumpy take says more about the jumps than about the floor.
+        sparse = after["sparse"]
+        planted = np.zeros(len(sparse), dtype=bool)
+        for p in pins or ():
+            if getattr(p, "enabled", True) and getattr(p, "mode", "FLOOR") == "FLOOR" and str(p.owner).startswith("leg."):
+                planted |= (sparse >= p.lock_in) & (sparse <= p.lock_out)
+        sel = planted if planted.sum() >= 5 else np.ones(len(sparse), dtype=bool)
+        b = (np.median(before["mesh_low"][sel]) - floor_z) / u
+        a = (np.median(after["mesh_low"][sel]) - floor_z) / u
+        every = (np.median(after["mesh_low"]) - floor_z) / u
+        where = f"{int(sel.sum())} planted frames" if planted.sum() >= 5 else "all frames"
+        row("Character mesh rests at (floor = 0)", f"{b:+.2f} cm",
+            f"{a:+.2f} cm on {where} (all frames {every:+.2f}), lowest {(after['mesh_low'].min() - floor_z) / u:+.2f} cm",
             f"+-{lim['mesh_cm']} cm", bool(abs(a) <= lim["mesh_cm"]))
     return rows, failed
 

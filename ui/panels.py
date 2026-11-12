@@ -104,9 +104,7 @@ def _floor_rows(col, st) -> None:
     col.prop(st, "floor_object")
     if st.floor_object is None:
         col.prop(st, "floor_auto")
-        sub = col.column(align=True)
-        sub.enabled = not st.floor_auto
-        sub.prop(st, "floor_z")
+        col.prop(st, "floor_z")
 
 
 def _scope(layout, st):
@@ -134,10 +132,11 @@ def _draw_diagnose(layout, context, st, rig):
             sub.label(text=part)
         if data.suggested_cutoff > 0.0:
             sub.label(text=f"Suggested filter cutoff: {data.suggested_cutoff:.1f} Hz")
+        rest = data.floor_estimate - data.sole_offset
         if (data.has_floor_estimate and not st.floor_auto and st.floor_object is None
-                and abs(data.floor_estimate - st.floor_z) > 0.02 * common.profile_of(rig).unit):
+                and abs(rest - st.floor_z) > 0.02 * common.profile_of(rig).unit):
             row = box.row(align=True)
-            row.label(text=f"Feet rest at {data.floor_estimate:.3f}", icon="INFO")
+            row.label(text=f"Feet rest at {rest:.3f}", icon="INFO")
             row.operator("mocap.floor_from_feet", text="Use")
     if len(data.issues):
         layout.template_list("MOCAP_UL_issues", "", data, "issues", data, "active_issue", rows=6)

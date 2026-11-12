@@ -5,6 +5,7 @@ Every test here reproduces a situation that was found by running the add-on on r
 """
 
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -168,26 +169,33 @@ def test_toe_bend_is_stable():
 
 
 def test_floating_take_is_cleaned_without_setting_the_floor():
-    """A retargeted take whose feet rest 6 cm above the grid: one click still plants them."""
+    """A retargeted take whose feet rest 6 cm above the grid: one click puts it on the grid (one shift of the
+    whole take, reported) and plants the feet there."""
     rig, gt, st = ta.make_scene()
     bpy.ops.object.mode_set(mode="OBJECT")
     rig.location.z = 0.06
     bpy.context.view_layer.update()
     data = rig.mocap_cleanup
     assert st.floor_auto and st.floor_z == 0.0 and st.floor_object is None
+    raw_paths = {(fc.data_path, fc.array_index) for fc in action_io.iter_fcurves(rig)}
     assert bpy.ops.mocap.analyze() == {"FINISHED"}
     assert "SKATE" in {i.kind for i in data.issues}, data.analysis_summary
-    assert abs(st.floor_z - 0.06) < 0.008, st.floor_z
+    assert st.floor_z == 0.0 and data.has_floor_estimate and abs(data.floor_estimate - 0.06) < 0.008
     assert bpy.ops.mocap.run_all() == {"FINISHED"}
+    m = re.search(r"take lowered ([0-9.]+) cm onto the floor", data.last_result)
+    assert m and 5.0 <= float(m.group(1)) <= 6.5, data.last_result
     profile, smp = sample_rig(rig)
     slide = plant_slide(profile, smp, gt)
     rest = min(float(sole_world(profile, smp, S)[..., 2].min()) for S in ("L", "R"))
-    print(f"   feet at {st.floor_z * 100:.1f} cm: {sum(p.auto for p in data.pins)} plants, slide {slide * 1000:.2f} mm, lowest sole {rest * 100:.2f} cm")
+    print(f"   {data.last_result[:90]}: {sum(p.auto for p in data.pins)} plants, slide {slide * 1000:.2f} mm, lowest sole {rest * 100:.2f} cm")
     assert sum(p.auto for p in data.pins) >= 6 and slide < 0.002 and abs(rest - st.floor_z) < 0.001
     assert not {"SKATE", "PENETRATION"} & {i.kind for i in data.issues}, data.analysis_summary
 
-    # by hand: the floor stays where it is put, and the panel can tell where the feet are
+    # Restore Raw takes the shift off again, exactly (the root curve the shift made goes too)
     bpy.ops.mocap.restore_raw()
+    assert {(fc.data_path, fc.array_index) for fc in action_io.iter_fcurves(rig)} == raw_paths
+
+    # by hand: the floor stays where it is put, and the panel can tell where the feet are
     st.floor_auto = False
     st.floor_z = 0.0
     bpy.ops.mocap.analyze()

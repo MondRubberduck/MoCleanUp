@@ -8,7 +8,7 @@ from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, St
 from bpy.types import Operator
 
 from .. import props
-from ..core import action_io, raw_snapshot, runtime, sampler
+from ..core import action_io, floor_fit, raw_snapshot, runtime, sampler
 from ..core.rig_inspector import solver_bone_names
 from ..stages import solver
 from ..stages import stage1_diagnostics as s1
@@ -376,7 +376,7 @@ class MOCAP_OT_dedrift(_MocapOperator):
         rig = common.require_rig(context, need_rigify=True)
         st = context.scene.mocap_cleanup
         resolve = common.begin_edit(rig)
-        res = s3.remove_drift(rig, _floor_pins(rig), floor_z=st.floor_z, floor_object=st.floor_object,
+        res = s3.remove_drift(rig, _floor_pins(rig), floor_z=common.floor_for(context, rig), floor_object=st.floor_object,
                               smooth_hz=st.drift_smooth_hz, strength=st.drift_strength)
         common.end_edit(context, rig, resolve)
         return "Drift: " + res.summary()
@@ -391,7 +391,7 @@ class MOCAP_OT_level_floor(_MocapOperator):
         rig = common.require_rig(context, need_rigify=True)
         st = context.scene.mocap_cleanup
         resolve = common.begin_edit(rig)
-        res = s3.level_floor(rig, None, floor_z=st.floor_z, floor_object=st.floor_object,
+        res = s3.level_floor(rig, None, floor_z=common.floor_for(context, rig), floor_object=st.floor_object,
                              smooth_hz=st.drift_smooth_hz, strength=st.drift_strength)
         common.end_edit(context, rig, resolve)
         return "Floor: " + res.summary()
@@ -400,20 +400,14 @@ class MOCAP_OT_level_floor(_MocapOperator):
 class MOCAP_OT_floor_from_feet(_MocapOperator):
     bl_idname = "mocap.floor_from_feet"
     bl_label = "Floor from Feet"
-    bl_description = "Set the floor height to where the feet rest in this take"
+    bl_description = "Set the floor height to where the character's feet rest in this take (the take is not moved)"
 
     def run(self, context):
         rig = common.require_rig(context, need_rigify=True)
-        profile = common.profile_of(rig)
-        f0, f1 = action_io.get_action_frame_range(rig)
-        smp = sampler.sample_objects([(rig, solver_bone_names(profile, rig.data.bones))], f0, f1)[rig.name]
-        soles = s3._sole_points(profile, smp)
-        if not soles:
-            raise MocapError("The rig has no foot geometry")
-        z = s4.estimate_floor_height(soles, s2.scene_fps(context.scene), profile.unit)
-        context.scene.mocap_cleanup.floor_z = z
+        rest, k, _n = _feet_rest(context, rig)
+        context.scene.mocap_cleanup.floor_z = rest - k
         rig.mocap_cleanup.analysis_stale = True
-        return f"Floor height set to {z:.4f}"
+        return f"Floor height set to {rest - k:.4f}"
 
 
 class MOCAP_OT_close_loop(_MocapOperator):
@@ -453,6 +447,66 @@ class MOCAP_OT_detect_contacts(_MocapOperator):
         return msg
 
 
+def _feet_rest(context, rig):
+    """Where the take's soles rest, ``(rig sole height, mesh offset below it, frames measured)``. Stores the offset."""
+    profile = common.profile_of(rig)
+    f0, f1 = action_io.get_action_frame_range(rig)
+    smp = sampler.sample_objects([(rig, solver_bone_names(profile, rig.data.bones))], f0, f1)[rig.name]
+    soles = s3._sole_points(profile, smp)
+    if not soles:
+        raise MocapError("The rig has no foot geometry")
+    rest = s4.estimate_floor_height(soles, s2.scene_fps(context.scene), profile.unit)
+    k, n = floor_fit.sole_offset(context.scene, rig, soles, f0, rest, profile.unit)
+    rig.mocap_cleanup.sole_offset = k
+    return rest, k, n
+
+
+def put_on_floor(context, rig) -> float | None:
+    """Feet on Floor: one vertical shift of the whole take so the resting mesh soles stand on the floor.
+    Returns the shift, None if the take could not be moved."""
+    st = context.scene.mocap_cleanup
+    profile = common.profile_of(rig)
+    rest, k, _n = _feet_rest(context, rig)
+    dz = st.floor_z + k - rest if st.floor_auto else 0.0
+    if abs(dz) <= 0.001 * profile.unit:
+        return 0.0
+    return dz if floor_fit.shift_take(rig, profile.root_ctrl, dz) else None
+
+
+def settle_on_floor(context, rig) -> float:
+    """After a solve: the solve flattens planted feet and lifts toes, which changes how far the shoe reaches
+    below the rig's sole points. Measure where the mesh rests now and shift the take by the rest; the sole
+    offset moves with it, so the solver's floor stays exactly where the soles are. Returns the shift."""
+    st = context.scene.mocap_cleanup
+    data = rig.mocap_cleanup
+    profile = common.profile_of(rig)
+    f0, f1 = action_io.get_action_frame_range(rig)
+    smp = sampler.sample_objects([(rig, solver_bone_names(profile, rig.data.bones))], f0, f1)[rig.name]
+    soles = s3._sole_points(profile, smp)
+    if not soles:
+        return 0.0
+    rest = s4.estimate_floor_height(soles, s2.scene_fps(context.scene), profile.unit)
+    m = floor_fit.mesh_rest(context.scene, rig, soles, f0, rest, profile.unit)
+    if m is None:
+        return 0.0
+    e = m - st.floor_z
+    if abs(e) <= 0.0005 * profile.unit or not floor_fit.shift_take(rig, profile.root_ctrl, -e):
+        return 0.0
+    data.sole_offset -= e
+    return -e
+
+
+def _floor_note(dz, k, unit) -> str:
+    parts = []
+    if dz is None:
+        parts.append("the feet do not rest on the floor (no root control to move the take)")
+    elif abs(dz) > 0.001 * unit:
+        parts.append(f"take {'raised' if dz > 0 else 'lowered'} {abs(dz) * 100:.1f} cm onto the floor")
+    if abs(k) > 0.002 * unit:
+        parts.append(f"mesh sole {k * 100:.1f} cm below the rig's")
+    return ", ".join(parts)
+
+
 def detect_contacts(context, rig) -> int:
     """Replace the detected pins of ``rig`` by a fresh detection (manual pins are kept). Returns their number."""
     st = context.scene.mocap_cleanup
@@ -462,9 +516,13 @@ def detect_contacts(context, rig) -> int:
     fps = s2.scene_fps(context.scene)
     smp = sampler.sample_objects([(rig, solver_bone_names(profile, rig.data.bones))], f0, f1)[rig.name]
     points = s3._sole_points(profile, smp)
-    if points:
-        common.sync_floor(context, s4.estimate_floor_height(points, fps, profile.unit))
-    floor = s4.Floor(st.floor_z, st.floor_object, context.evaluated_depsgraph_get())
+    # Feet on Floor: plants are found where the feet rest in the take (Clean Up Take has put them on the floor by
+    # then); otherwise against the floor as set
+    if points and st.floor_auto and st.floor_object is None:
+        z = s4.estimate_floor_height(points, fps, profile.unit)
+    else:
+        z = common.floor_for(context, rig)
+    floor = s4.Floor(z, st.floor_object, context.evaluated_depsgraph_get())
     if st.contact_hands:
         for arm in profile.arms.values():
             p = smp.head_w(arm.org_end).copy()
@@ -744,20 +802,34 @@ class MOCAP_OT_run_all(_MocapOperator):
                              filter_rotation=st.filter_rotation, euro_beta=st.euro_beta, unit=common.profile_of(rig).unit,
                              max_shift=st.filter_max_shift)
             steps.append(f"filter {st.cutoff_hz:.0f} Hz")
+        fit = None
+        if rigify and st.floor_object is None:
+            fit = put_on_floor(context, rig)
+            steps.append("")                       # the floor note, filled in when the take has settled
         if rigify and st.pipe_level:
-            r = s3.level_floor(rig, None, floor_z=st.floor_z, floor_object=st.floor_object)
+            r = s3.level_floor(rig, None, floor_z=common.floor_for(context, rig), floor_object=st.floor_object)
             steps.append(f"floor {r.max_vertical * 100:.0f} cm")
         if rigify and st.pipe_dedrift:
-            r = s3.remove_drift(rig, None, floor_z=st.floor_z, floor_object=st.floor_object, smooth_hz=st.drift_smooth_hz)
+            r = s3.remove_drift(rig, None, floor_z=common.floor_for(context, rig), floor_object=st.floor_object,
+                                smooth_hz=st.drift_smooth_hz)
             steps.append(f"drift {r.max_horizontal * 100:.0f} cm")
         if rigify and st.pipe_contacts:
             steps.append(f"{detect_contacts(context, rig)} contacts")
         if rigify and st.pipe_solve:
             res = common.run_solve(context, rig)
             steps.append("solve")
+            if fit is not None and st.floor_auto and st.floor_object is None:
+                fit += settle_on_floor(context, rig)
+        if "" in steps:
+            note = _floor_note(fit, rig.mocap_cleanup.sole_offset, common.profile_of(rig).unit)
+            i = steps.index("")
+            steps[i:i + 1] = [note] if note else []
         common.end_edit(context, rig)
         after = common.run_analyze(context, rig)
-        # say how far the cleanup moved the body: the one number that tells whether it is still the same take
+        # say how far the cleanup moved the body: the one number that tells whether it is still the same take.
+        # The floor shift moves every joint alike and is reported on its own, so it is not part of it.
+        if fit:
+            before = {k: v + np.array([0.0, 0.0, fit]) for k, v in before.items()}
         change = s1.largest_change(before, after.joints, after.f0)
         moved = f" Largest change: {change[0]} {change[1] * 100:.1f} cm at frame {change[2]}." if change and change[1] > 5e-4 else ""
         return "Done: " + ", ".join(steps) + "." + moved + " Left: " + rig.mocap_cleanup.analysis_summary

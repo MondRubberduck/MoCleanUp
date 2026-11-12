@@ -184,6 +184,7 @@ class MCRigData(PropertyGroup):
     suggested_cutoff: FloatProperty(default=0.0)
     floor_estimate: FloatProperty(default=0.0)
     has_floor_estimate: BoolProperty(default=False)
+    sole_offset: FloatProperty(default=0.0, description="How far the character mesh rests below the rig's sole points")
     last_result: StringProperty()
 
     def pin_data(self) -> list[KinematicPin]:
@@ -200,11 +201,13 @@ class MCSettings(PropertyGroup):
                                 description="Limit curve edits to the selected pose bones")
 
     # floor
-    floor_z: FloatProperty(name="Floor Height", default=0.0, unit="LENGTH", update=_solve_setting_update)
-    floor_auto: BoolProperty(name="Floor from Feet", default=True, update=_solve_setting_update,
-                             description="Use the height at which the feet rest in this take as the floor (refreshed "
-                                         "whenever the take is analyzed or contacts are detected). Turn off to set the "
-                                         "height yourself, e.g. to bring a floating take down onto the ground")
+    floor_z: FloatProperty(name="Floor Height", default=0.0, unit="LENGTH", update=_solve_setting_update,
+                           description="Height of the floor the character stands on (the grid is 0)")
+    floor_auto: BoolProperty(name="Feet on Floor", default=True, update=_solve_setting_update,
+                             description="Clean Up Take raises or lowers the whole take by one amount so that the "
+                                         "character's resting feet stand on the floor (measured on the character mesh). "
+                                         "The motion itself does not change. Off: the take stays where it is and only "
+                                         "feet below the floor are lifted")
     floor_object: PointerProperty(name="Terrain", type=bpy.types.Object, poll=_poll_mesh, update=_solve_setting_update,
                                   description="Optional mesh to walk on (stairs, slopes); the plane is the fallback")
 
@@ -344,14 +347,16 @@ class MCSettings(PropertyGroup):
                                       description="Show error marks of the selected bones only")
 
 
-def solve_settings(st: MCSettings, fps: float) -> SolveSettings:
-    """Solver settings from the scene properties (times -> frames)."""
+def solve_settings(st: MCSettings, fps: float, sole_offset: float = 0.0) -> SolveSettings:
+    """Solver settings from the scene properties (times -> frames). The solver floor is the floor the mesh
+    stands on, raised by how far the mesh rests below the rig's sole points."""
 
     def frames(seconds: float, lo: int = 0) -> int:
         return max(lo, int(round(seconds * fps)))
 
     return SolveSettings(
-        floor_z=st.floor_z, floor_object=st.floor_object.name if st.floor_object else "", use_floor=st.use_floor,
+        floor_z=st.floor_z + sole_offset, floor_object=st.floor_object.name if st.floor_object else "",
+        use_floor=st.use_floor,
         floor_cushion=frames(st.floor_cushion), clip_hands=st.clip_hands, clip_toes=st.clip_toes,
         flat_tolerance_deg=st.flat_tolerance, use_pins=st.use_pins, pin_max_shift=st.pin_max_shift,
         use_knee_fix=st.use_knee_fix, max_extension=st.max_extension, softness=st.softness,

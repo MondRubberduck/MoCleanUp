@@ -122,6 +122,29 @@ def delete_raw_snapshot(obj) -> bool:
     return True
 
 
+def _reset_channel(obj, data_path: str, index: int) -> None:
+    """Put a transform channel back to its rest value (location / Euler 0, quaternion identity, scale 1)."""
+    try:
+        prop = obj.path_resolve(data_path)
+    except ValueError:
+        return
+    tail = data_path.rsplit(".", 1)[-1]
+    if tail == "scale":
+        value = 1.0
+    elif tail == "rotation_quaternion":
+        value = 1.0 if index == 0 else 0.0
+    elif tail == "rotation_axis_angle":
+        value = 1.0 if index == 2 else 0.0
+    elif tail in ("location", "rotation_euler"):
+        value = 0.0
+    else:
+        return
+    try:
+        prop[index] = value
+    except (TypeError, IndexError):
+        pass
+
+
 def restore_region_to_raw(obj, frame_start: int | None = None, frame_end: int | None = None,
                           blend_factor: float = 1.0, falloff_frames: int = 4,
                           bone_names: list[str] | None = None) -> int:
@@ -146,6 +169,14 @@ def restore_region_to_raw(obj, frame_start: int | None = None, frame_end: int | 
     w = blend_window_weights(T, r0 - f0, r1 - f0, falloff_frames, falloff_frames) * float(blend_factor)
     wanted = set(bone_names) if bone_names else None
     count = 0
+    if frame_start is None and frame_end is None and wanted is None and blend_factor >= 1.0:
+        # the whole take: curves the capture never had (e.g. the root shift of Feet on Floor) go as well
+        raw_keys = {(fc.data_path, fc.array_index) for fc in cb_raw.fcurves}
+        for fc in [fc for fc in cb_cur.fcurves if (fc.data_path, fc.array_index) not in raw_keys]:
+            path, index = fc.data_path, fc.array_index
+            cb_cur.fcurves.remove(fc)
+            _reset_channel(obj, path, index)     # a channel without a curve keeps its last value otherwise
+            count += 1
     for fc_raw in cb_raw.fcurves:
         if wanted is not None and fcurve_bone_name(fc_raw) not in wanted:
             continue

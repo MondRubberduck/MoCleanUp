@@ -129,7 +129,8 @@ def run_solve(context, rig, use_cache: bool = True):
         raise MocapError("The take has a residual detail layer. Merge it first (Keys stage)")
     st = context.scene.mocap_cleanup
     data = rig.mocap_cleanup
-    res = solver.solve(rig, data.pin_data(), props.solve_settings(st, scene_fps(context.scene)), use_cache=use_cache)
+    res = solver.solve(rig, data.pin_data(), props.solve_settings(st, scene_fps(context.scene), data.sole_offset),
+                       use_cache=use_cache)
     data.last_result = res.summary()
     data.analysis_stale = True
     sync_chains(rig)
@@ -137,13 +138,10 @@ def run_solve(context, rig, use_cache: bool = True):
     return res
 
 
-def sync_floor(context, estimate) -> float:
-    """With 'Floor from Feet' on (and no terrain object) the floor height follows the take."""
-    st = context.scene.mocap_cleanup
-    if st.floor_auto and st.floor_object is None and estimate is not None and abs(st.floor_z - estimate) > 1e-7:
-        with props.suspend_updates():
-            st.floor_z = float(estimate)
-    return st.floor_z
+def floor_for(context, rig) -> float:
+    """The floor as the rig's sole points see it: the visible floor, raised by how far the character mesh rests
+    below those points (QA M3: 2-3 cm on rigs built for game skeletons)."""
+    return context.scene.mocap_cleanup.floor_z + rig.mocap_cleanup.sole_offset
 
 
 def run_analyze(context, rig):
@@ -156,11 +154,9 @@ def run_analyze(context, rig):
     # floor, that floor stays: estimating it again from corrected feet would push it up every time.
     follow = st.floor_auto and raw_snapshot.get_solve_base(rig) is None
     solved = raw_snapshot.get_solve_base(rig) is not None
-    report = s1.analyze(rig, floor_z=st.floor_z, floor_object=st.floor_object, spike_z=st.spike_sensitivity,
+    report = s1.analyze(rig, floor_z=floor_for(context, rig), floor_object=st.floor_object, spike_z=st.spike_sensitivity,
                         jitter_z=st.jitter_sensitivity, hyperext=hyperext, auto_floor=follow,
                         pins=rig.mocap_cleanup.pin_data() if solved else None)
-    if follow:
-        sync_floor(context, report.floor_estimate)
     runtime.REPORTS[rig.name] = report
     data = rig.mocap_cleanup
     with props.suspend_updates():
