@@ -1,5 +1,9 @@
 # MoCap Cleanup Studio: developer handoff
 
+> **Work in progress: the response to the QA pass.** Read `docs/HANDOFF_QA_response.md` first. It has the plan,
+> what is done (rows 1-4), what is open (rows 5-12, including Rig Bridge and Bulletproof Retarget), how to verify,
+> and the user's rules. The text below describes the architecture and is not yet updated for rows 2-4.
+
 State: feature complete for 1.0.0. All headless tests pass on Blender 5.2 and 5.3; the workspace and the
 overlays were checked in a GUI session on 5.3. This file replaces the handoff of the first agent
 (`docs/HANDOFF_previous_agent.md`); none of the code that one describes is left.
