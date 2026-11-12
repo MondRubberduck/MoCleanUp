@@ -20,7 +20,7 @@ import bpy
 import numpy as np
 
 from ..core import action_io, sampler
-from ..core.dsp import whittaker_lambda_for_cutoff, whittaker_smooth
+from ..core.dsp import find_runs, whittaker_lambda_for_cutoff, whittaker_smooth
 from ..core.math_quat import (
     quat_conjugate,
     quat_exp,
@@ -115,7 +115,16 @@ def estimate_drift(soles: dict[str, np.ndarray], weights: dict[str, np.ndarray],
         w = np.exp(-(h - h.min(axis=1, keepdims=True)) / (0.0015 * unit))
         w /= w.sum(axis=1, keepdims=True)
         vel = np.gradient(pts, axis=0)                                 # per frame
-        num += g[:, None] * np.sum(w[..., None] * vel, axis=1)         # velocity of the contact region
+        v_contact = np.sum(w[..., None] * vel, axis=1)                 # velocity of the contact region
+        # Within one plant the drift changes slowly. Frames that move differently from the rest of
+        # their plant are the foot arriving or leaving (the detection is generous), not drift.
+        g = g.copy()
+        for s, e in find_runs(g > 0.0):
+            v = v_contact[s : e + 1]
+            dev = np.linalg.norm(v - np.median(v, axis=0), axis=1)
+            tol = max(3.0 * 1.4826 * float(np.median(dev)), 0.02 * unit / fps)
+            g[s : e + 1] *= dev <= tol
+        num += g[:, None] * v_contact
         height_num += g * h.min(axis=1)
         den += g
     supported = den > 0.0
@@ -156,10 +165,12 @@ def remove_drift(rig, pins: list | None = None, *, floor_z: float = 0.0, floor_o
     if not soles:
         raise RuntimeError("The rig has no foot geometry to detect contacts with")
     if pins is None:
-        # Drifting data is not on the floor yet: detect against the estimated ground level and with
-        # a generous speed tolerance (a drifting plant is still a plant).
+        # Drifting data is not on the floor yet: detect against the estimated ground level, with a
+        # generous speed tolerance and without asking the foot to stay in one place (a drifting plant
+        # is still a plant). This is what makes the stage unsafe on takes without drift: there a low,
+        # slow step looks the same. It only runs when asked for.
         est = _MovingGround(soles, fps) if vertical else floor
-        pins, _ = s4.detect_contacts(soles, est, f0, fps, profile.unit, height_tol=0.04, speed_tol=0.6)
+        pins, _ = s4.detect_contacts(soles, est, f0, fps, profile.unit, height_tol=0.04, speed_tol=0.6, travel_tol=0.0)
     plants = [p for p in pins if p.enabled and p.owner in soles and p.mode == "FLOOR"]
     weights = {k: _plant_weights(plants, k, f0, T) for k in soles}
     drift = estimate_drift(soles, weights, floor, fps, profile.unit, smooth_hz, horizontal, vertical)

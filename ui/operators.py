@@ -82,15 +82,15 @@ class MOCAP_OT_use_active_rig(_MocapOperator):
 
 PRESETS = {
     "OPTICAL": dict(filter_method="MODIFIED_SINC", cutoff_hz=10.0, filter_adaptive=False, spike_sensitivity=6.5,
-                    filter_max_shift=0.015,
+                    filter_max_shift=0.015, contact_speed=0.12,
                     pipe_repair=True, pipe_filter=True, pipe_dedrift=False, pipe_level=False, pipe_contacts=True,
                     pipe_solve=True, use_ballistic=False, use_knee_fix=True, use_pelvis=True),
     "IMU": dict(filter_method="WHITTAKER", cutoff_hz=8.0, filter_adaptive=False, spike_sensitivity=8.0,
-                filter_max_shift=0.02,
+                filter_max_shift=0.02, contact_speed=0.18,
                 pipe_repair=True, pipe_filter=True, pipe_dedrift=True, pipe_level=True, pipe_contacts=True,
                 pipe_solve=True, use_ballistic=False, use_knee_fix=True, use_pelvis=True, drift_smooth_hz=1.5),
     "VIDEO": dict(filter_method="WHITTAKER", cutoff_hz=5.0, filter_adaptive=False, spike_sensitivity=5.5,
-                  filter_max_shift=0.04,
+                  filter_max_shift=0.04, contact_speed=0.25,
                   pipe_repair=True, pipe_filter=True, pipe_dedrift=True, pipe_level=True, pipe_contacts=True,
                   pipe_solve=True, use_ballistic=True, use_knee_fix=True, use_pelvis=True, drift_smooth_hz=1.0),
 }
@@ -473,7 +473,7 @@ def detect_contacts(context, rig) -> int:
         raise MocapError("The rig has no foot geometry")
     pins, _ = s4.detect_contacts(points, floor, f0, fps, profile.unit, height_tol=st.contact_height,
                                  speed_tol=st.contact_speed, blend_in=st.pin_blend_in, blend_out=st.pin_blend_out,
-                                 min_duration=st.contact_min_time)
+                                 min_duration=st.contact_min_time, travel_tol=st.contact_travel)
     manual = [p.to_data() for p in data.pins if not p.auto]
     # a manual pin wins over a detected one on the same limb and frames
     pins = [p for p in pins if not any(m.owner == p.owner and m.lock_in <= p.lock_out and m.lock_out >= p.lock_in

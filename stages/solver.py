@@ -59,6 +59,8 @@ class SolveSettings:
     flat_tolerance_deg: float = 4.0
     # pins
     use_pins: bool = True
+    pin_max_shift: float = 0.05            # detected plants: metres along the floor for a 1.75 m character, 0 = no limit
+    pin_max_yaw_deg: float = 12.0          # ... and degrees about the vertical
     # knees / elbows
     use_knee_fix: bool = True
     max_extension: float = 0.995
@@ -95,6 +97,7 @@ class SolveResult:
     ik_activated: list[str] = field(default_factory=list)
     written: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    gave_way: list[tuple] = field(default_factory=list)      # (owner, first frame, last frame, metres) of detected pins
     resampled: bool = True
     seconds: float = 0.0
 
@@ -400,10 +403,12 @@ def solve(rig, pins: list[s4.KinematicPin], settings: SolveSettings | None = Non
     # ---- limb pins ---------------------------------------------------------------------------------------
     rest_world0 = smp.obj_world[0]
     tmats = target_mats(D_torso)
+    gave_way: list = []
     for k, L in limbs.items():
         limb = L["limb"]
         kw = dict(f0=f0, fps=fps, unit=unit, floor=floor, targets=tmats, end_radius=0.5 * limb.end_radius,
-                  flat_tol=np.radians(st.flat_tolerance_deg))
+                  flat_tol=np.radians(st.flat_tolerance_deg), max_shift=st.pin_max_shift * unit,
+                  max_yaw=np.radians(st.pin_max_yaw_deg), notes=gave_way)
         if limb.kind == "leg" and len(limb.sole_points):
             fwd = limb.ball_local - limb.heel_local
             fwd = fwd / max(np.linalg.norm(fwd), 1e-9)
@@ -414,6 +419,13 @@ def solve(rig, pins: list[s4.KinematicPin], settings: SolveSettings | None = Non
         L["pos"], L["quat"], L["pin_w"], L["planted"] = p, q, w, planted
         res.warnings += rep
         res.pins_applied += sum(1 for pin in pins if pin.owner == k) - len(rep)
+    for pin, far, a, b in gave_way:
+        res.gave_way.append((pin.owner, a, b, far / unit))
+    if gave_way:
+        pin, far, a, b = max(gave_way, key=lambda g: g[1])
+        more = f" (and {len(gave_way) - 1} more)" if len(gave_way) > 1 else ""
+        res.warnings.append(f"{pin.name or pin.owner}: holding it would carry the foot {far / unit * 100:.0f} cm at frames "
+                            f"{a}-{b}, so it gives way there{more}. If the foot is planted, pin it by hand")
 
     def toe_geometry(L):
         """Toe joint, toe tip, hinge axis and sole normal for the current foot target of a leg."""

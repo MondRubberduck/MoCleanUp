@@ -95,6 +95,30 @@ def chain_agreement(scene, rig, profile, fcurves, frames) -> dict[str, np.ndarra
     return {l.key: np.linalg.norm(pos[(0.0, l.key)] - pos[(1.0, l.key)], axis=1) for l in limbs}
 
 
+def plant_slide(soles: dict, pins, f0: int, fps: float):
+    """How fast the grounded part of a pinned foot moves along the floor: ``(p90, max)`` in units per second.
+
+    Inside the locked frames of the floor pins, per frame the sole point that moves least (a foot
+    that rolls or turns on its ball is not sliding). ``soles``: ``{"L": (T, K, 3), ...}``.
+    """
+    speeds = []
+    for S, pts in soles.items():
+        if len(pts) < 3:
+            continue
+        v = np.zeros(pts.shape[:2])
+        v[1:-1] = np.linalg.norm(pts[2:, :, :2] - pts[:-2, :, :2], axis=2) * (0.5 * fps)
+        slow = v.min(axis=1)
+        for p in pins:
+            if p.owner == f"leg.{S}" and p.mode == "FLOOR" and p.enabled:
+                a, b = max(p.lock_in - f0 + 1, 1), min(p.lock_out - f0 - 1, len(pts) - 2)
+                if b >= a:
+                    speeds.append(slow[a : b + 1])
+    if not speeds:
+        return 0.0, 0.0
+    allv = np.concatenate(speeds)
+    return float(np.percentile(allv, 90)), float(allv.max())
+
+
 def knee_acceleration(profile, smp, fps: float) -> float:
     """Largest knee angular acceleration of the take in deg/s^2."""
     worst = 0.0

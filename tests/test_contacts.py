@@ -20,13 +20,15 @@ def corrupt_feet(rig, gt, slide=0.035, sink=0.012, seed=0):
     """Footskate inside every stance phase, a little vertical sinking and measurement noise."""
     rng = np.random.default_rng(seed)
     f0, T = gt["f0"], gt["T"]
+    full = max(b - a + 1 for S in ("L", "R") for a, b in gt["plants"][S])
     for S in ("L", "R"):
         ch = action_io.read_bone_local_channels(rig, f"foot_ik.{S}", f0, gt["f1"])
         loc = ch["loc"].copy()
         for a, b in gt["plants"][S]:
             n = b - a + 1
             u = np.linspace(0.0, 1.0, n)
-            loc[a - f0 : b - f0 + 1, 1] += slide * (u - 0.5)
+            # the foot creeps at one speed (6 cm/s): a stance that the take cuts short creeps less far
+            loc[a - f0 : b - f0 + 1, 1] += slide * (n / full) * (u - 0.5)
             loc[a - f0 : b - f0 + 1, 0] += 0.4 * slide * np.sin(np.pi * u)
             loc[a - f0 : b - f0 + 1, 2] -= sink * np.sin(np.pi * u) ** 2
         loc += rng.normal(0.0, 0.0015, loc.shape)

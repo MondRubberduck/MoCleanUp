@@ -99,22 +99,12 @@ def soles(profile, smp):
 
 
 def measure(profile, smp, pins, floor_z):
-    slides, depth, pop = [], 0.0, 0.0
-    for S, pts in soles(profile, smp).items():
-        depth = max(depth, float(floor_z - pts[..., 2].min()))
-        for p in pins:
-            if p.owner == f"leg.{S}" and p.mode == "FLOOR" and p.enabled:
-                seg = pts[max(p.lock_in - f0, 0): p.lock_out - f0 + 1]
-                if len(seg) >= 3:
-                    low = int(np.argmin(seg[..., 2].mean(axis=0)))
-                    slides.append(float(np.linalg.norm(seg[:, low, :2] - seg[:1, low, :2], axis=1).max()))
-        leg = profile.legs[S]
-        a = smp.head_w(leg.org_upper) - smp.head_w(leg.org_lower)
-        b = smp.head_w(leg.org_end) - smp.head_w(leg.org_lower)
-        ang = np.degrees(np.arccos(np.clip(np.einsum("ti,ti->t", a, b) / (np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1) + 1e-12), -1, 1)))
-        pop = max(pop, float(np.abs(np.diff(ang, 2)).max()))
+    """Slide of the pinned feet (cm/s: 90th percentile, maximum) and depth of the soles below the floor (mm)."""
+    sl = soles(profile, smp)
     u = profile.unit
-    return (max(slides) / u * 1000 if slides else 0.0), depth / u * 1000, pop, len(slides)
+    p90, worst = harm.plant_slide(sl, pins, f0, scene.render.fps / scene.render.fps_base)
+    depth = max((float(floor_z - pts[..., 2].min()) for pts in sl.values()), default=0.0)
+    return p90 / u * 100, worst / u * 100, depth / u * 1000
 
 
 # ---- rendering ------------------------------------------------------------------------------------------------------
@@ -283,7 +273,7 @@ assert bpy.ops.mocap.run_all() == {"FINISHED"}
 print(f"  one click ({time.time() - t:.1f}s): {data.last_result}")
 profile, smp1 = sample()
 b, a = measure(profile, smp0, data.pins, st.floor_z), measure(profile, smp1, data.pins, st.floor_z)
-print(f"  {a[3]} plants | slide {b[0]:.1f} -> {a[0]:.2f} mm | below floor {b[1]:.1f} -> {a[1]:.2f} mm | knee accel {b[2]:.1f} -> {a[2]:.1f} deg/f^2")
+print(f"  pinned feet slide at (p90 / max) {b[0]:.1f} / {b[1]:.1f} -> {a[0]:.2f} / {a[1]:.2f} cm/s | soles below the floor {b[2]:.1f} -> {a[2]:.2f} mm")
 spans = sorted(((p.lock_out - p.lock_in + 1, p.owner, p.lock_in, p.lock_out) for p in data.pins), reverse=True)
 print(f"  {len(spans)} pins" + (f", the longest: {[(o, i, j) for _n, o, i, j in spans[:4]]}" if spans else ""))
 cleaned = curves()

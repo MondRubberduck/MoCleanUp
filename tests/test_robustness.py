@@ -60,9 +60,13 @@ def test_only_feet_that_hold_still_are_plants():
     # a walk: every stance is found
     pins, _ = s4.detect_contacts(_feet(T, fps, 0.0), floor, 1, fps)
     assert sum(p.owner == "leg.L" for p in pins) >= 3 and sum(p.owner == "leg.R" for p in pins) >= 3, len(pins)
-    # retarget skate: the stance foot creeps at 0.2 m/s (10 cm per step). Still a plant - the one to fix.
-    pins, _ = s4.detect_contacts(_feet(T, fps, 0.2), floor, 1, fps)
+    # retarget skate: the stance foot creeps at 5 cm/s (2.5 cm per step). Still a plant - the one to fix.
+    pins, _ = s4.detect_contacts(_feet(T, fps, 0.05), floor, 1, fps)
     assert sum(p.owner == "leg.L" for p in pins) >= 3, len(pins)
+    # 20 cm/s, 10 cm per step: that is a slow step, not a plant. (This used to be pinned: on a real
+    # fight take it erased every shuffle and left the legs crossed.)
+    pins, _ = s4.detect_contacts(_feet(T, fps, 0.2), floor, 1, fps)
+    assert not pins, [(p.owner, p.lock_in, p.lock_out) for p in pins]
     # an in-place run: the foot on the floor travels backwards at 2 m/s. Nothing may be planted.
     for speed in (0.9, 2.0, 3.5):
         pins, _ = s4.detect_contacts(_feet(T, fps, -speed), floor, 1, fps)
@@ -661,6 +665,109 @@ def test_a_leg_switched_to_ik_takes_its_toes_along():
     assert np.abs(tip1[:10] - tip0[:10]).max() < 0.001 and np.abs(tip1[-10:] - tip0[-10:]).max() < 0.001
 
 
+# ---- a foot that travels is not planted --------------------------------------------------------------------------------
+# Found by a QA pass on a 5756-frame fight take: slow, low steps were detected as sliding plants and
+# pinned. One click moved a foot 78 cm, erased steps and left the legs crossed.
+
+def _foot_path(y, z=None, yaw=None, fps=30.0):
+    """Sole points ``(T, 4, 3)``, ankle positions and quaternions of a foot at ``y (T,)`` (pointing to -Y)."""
+    from mocap_cleanup.core.math_quat import quat_axis_angle, quat_rotate
+    T = len(y)
+    pos = np.stack([np.zeros(T), np.asarray(y, dtype=float), np.zeros(T) if z is None else np.asarray(z, dtype=float)], axis=1)
+    quat = quat_axis_angle(np.array([0.0, 0.0, 1.0]), np.zeros(T) if yaw is None else np.asarray(yaw, dtype=float))
+    return pos[:, None, :] + quat_rotate(quat[:, None, :], SOLE[None]), pos, quat
+
+
+def test_a_slow_step_is_not_a_plant():
+    fps, floor = 30.0, s4.Floor(0.0)
+    # planted, then a slow low step (30 cm at 16 cm/s, 3 cm up), planted again: the step of the take
+    T = 150
+    t = np.arange(T)
+    u = np.clip((t - 45) / 56.0, 0.0, 1.0)
+    y = -0.30 * u
+    z = 0.03 * np.sin(np.pi * u) ** 0.5
+    air = np.stack([np.full(T, 0.3), np.zeros(T), np.full(T, 0.3)], axis=1)[:, None, :] + SOLE[None]
+    for speed_tol in (0.15, 0.12, 0.25):                            # default, Optical, Video
+        pts, *_ = _foot_path(y, z)
+        pins, _ = s4.detect_contacts({"leg.L": pts, "leg.R": air}, floor, 1, fps, speed_tol=speed_tol)
+        cover = _covered(pins, "leg.L", 1, T)
+        assert len(pins) == 2, (speed_tol, [(p.lock_in, p.lock_out) for p in pins])
+        assert cover[5:40].all() and cover[108:145].all() and not cover[50:98].any(), (speed_tol, np.flatnonzero(cover))
+    # the same step, flat on the floor all the way (a shuffle): still a step
+    pts, *_ = _foot_path(y)
+    pins, _ = s4.detect_contacts({"leg.L": pts, "leg.R": air}, floor, 1, fps)
+    assert not _covered(pins, "leg.L", 1, T)[50:98].any(), [(p.lock_in, p.lock_out) for p in pins]
+    # a foot that creeps 2 cm during a long stance is one plant
+    pts, *_ = _foot_path(-0.02 * t / T)
+    pins, _ = s4.detect_contacts({"leg.L": pts, "leg.R": air}, floor, 1, fps)
+    assert [(p.lock_in, p.lock_out) for p in pins] == [(1, T)], [(p.lock_in, p.lock_out) for p in pins]
+
+
+def test_a_contact_is_cut_where_the_foot_travels():
+    T = 200
+    t = np.arange(T, dtype=float)
+    two = np.zeros((T, 2))                                          # rests, goes 20 cm in 2.5 s (8 cm/s), rests
+    two[:, 1] = -0.20 * np.clip((t - 60) / 75.0, 0.0, 1.0)
+    creep = 0.06 / 30.0                                             # 6 cm/s at 30 fps
+    runs = s4.split_by_travel(two, [(0, T - 1)], 0.03, creep=creep)
+    assert len(runs) == 2 and runs[0][0] == 0 and runs[1][1] == T - 1, runs
+    assert runs[0][1] < 72 and runs[1][0] > 123, runs                # the way between them belongs to neither
+    drift = np.zeros((T, 2))                                        # travels all the time: 8 cm/s for 53 cm
+    drift[:, 0] = 0.08 / 30.0 * t
+    assert s4.split_by_travel(drift, [(0, T - 1)], 0.03, creep=creep) == []   # not a staircase of little plants
+    wander = np.zeros((T, 2))                                       # stays within 3 cm of one place
+    wander[:, 0] = 0.012 * np.sin(t / 40.0)
+    assert s4.split_by_travel(wander, [(0, T - 1)], 0.03, creep=creep) == [(0, T - 1)]
+
+
+def _pin_kw(fps=30.0):
+    return dict(f0=1, fps=fps, unit=1.0, floor=s4.Floor(0.0), sole=SOLE, forward_local=np.array([0.0, -1.0, 0.0]),
+                rest_quat=np.array([1.0, 0.0, 0.0, 0.0]))
+
+
+def test_a_detected_pin_gives_way():
+    T = 90
+    t = np.arange(T)
+    y = -0.30 * np.clip((t - 50) / 20.0, 0.0, 1.0)                  # rests, goes 30 cm, rests a little
+    _pts, pos, quat = _foot_path(y)
+    notes = []
+    found = s4.KinematicPin(owner="leg.L", mode="FLOOR", lock_in=1, lock_out=T, blend_in=0, blend_out=0, auto=True, name="Plant")
+    p, _q, _w, _pl, _rep = s4.apply_pins("leg.L", pos, quat, [found], max_shift=0.05, notes=notes, **_pin_kw())
+    moved = np.linalg.norm(p[:, :2] - pos[:, :2], axis=1)
+    assert moved.max() <= 0.05 + 1e-9 and moved[:45].max() < 1e-4, (moved.max(), moved[:45].max())   # holds where it rests, follows where it has to
+    assert len(notes) == 1 and notes[0][0] is found and notes[0][1] > 0.25 and notes[0][2] > 50, notes
+    # a pin made by hand holds whatever it takes
+    by_hand = s4.KinematicPin(owner="leg.L", mode="FLOOR", lock_in=1, lock_out=T, blend_in=0, blend_out=0)
+    notes = []
+    p, *_ = s4.apply_pins("leg.L", pos, quat, [by_hand], max_shift=0.05, notes=notes, **_pin_kw())
+    assert np.ptp(p[:, 1]) < 1e-6 and not notes, np.ptp(p[:, 1])
+
+
+def test_a_planted_foot_turns_on_its_ball():
+    from mocap_cleanup.core.math_quat import quat_rotate
+    T = 80
+    t = np.arange(T)
+    yaw = np.radians(40.0) * (0.5 - 0.5 * np.cos(np.pi * np.clip((t - 25) / 25.0, 0.0, 1.0)))
+    ball = SOLE[2:].mean(axis=0)
+    # the data: the ball stays where it is while the foot turns 40 degrees - and creeps 2 cm sideways (the error)
+    _p, pos0, quat = _foot_path(np.zeros(T), yaw=yaw)
+    pos = ball[None, :] - quat_rotate(quat, ball) + np.stack([0.02 * t / T, np.zeros(T), np.zeros(T)], axis=1)
+    pin = s4.KinematicPin(owner="leg.L", mode="FLOOR", lock_in=1, lock_out=T, blend_in=0, blend_out=0, auto=True)
+    p, q, *_ = s4.apply_pins("leg.L", pos, quat, [pin], max_shift=0.05, max_yaw=np.radians(12.0), **_pin_kw())
+    ball_w = p + quat_rotate(q, ball)
+    head = np.degrees(np.arctan2(*quat_rotate(q, np.array([0.0, -1.0, 0.0]))[:, [0, 1]].T * np.array([[1.0], [-1.0]])))
+    print(f"   foot turns {np.degrees(yaw[-1]):.0f} deg on its ball: after the pin it turns {np.ptp(head):.1f} deg, "
+          f"the ball moves {np.ptp(ball_w[:, :2], axis=0).max() * 1000:.2f} mm (data: 20 mm)")
+    assert abs(np.ptp(head) - 40.0) < 0.5                            # the pivot stays in
+    assert np.ptp(ball_w[:, :2], axis=0).max() < 0.005               # and the ball no longer creeps
+    # a foot that only wobbles 3 degrees is held at one heading
+    wobble = np.radians(3.0) * np.sin(t / 5.0)
+    _p, pos, quat = _foot_path(np.zeros(T), yaw=wobble)
+    _p2, q, *_ = s4.apply_pins("leg.L", pos, quat, [pin], max_shift=0.05, max_yaw=np.radians(12.0), **_pin_kw())
+    head = np.degrees(np.arctan2(*quat_rotate(q, np.array([0.0, -1.0, 0.0]))[:, [0, 1]].T * np.array([[1.0], [-1.0]])))
+    assert np.ptp(head) < 0.01, np.ptp(head)
+
+
 def test_unexpected_errors_are_reported_not_swallowed():
     rig, gt, st = ta.make_scene(n_frames=70)
     original = operators.common.run_analyze
@@ -697,5 +804,7 @@ if __name__ == "__main__":
                test_the_filter_keeps_fast_moves, test_a_snappy_take_comes_out_as_it_went_in,
                test_repair_touches_only_what_is_broken, test_frames_between_ik_and_fk_are_left_alone,
                test_a_kick_is_not_a_pole_whip, test_one_click_rebuilds_only_spikes_beyond_doubt,
-               test_a_leg_switched_to_ik_takes_its_toes_along,
+               test_a_leg_switched_to_ik_takes_its_toes_along, test_a_slow_step_is_not_a_plant,
+               test_a_contact_is_cut_where_the_foot_travels, test_a_detected_pin_gives_way,
+               test_a_planted_foot_turns_on_its_ball,
                test_unexpected_errors_are_reported_not_swallowed])

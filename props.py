@@ -250,8 +250,17 @@ class MCSettings(PropertyGroup):
     # stage 4
     contact_height: FloatProperty(name="Height Tolerance", default=0.04, min=0.005, max=0.3, unit="LENGTH",
                                   description="How close to the floor a foot has to be (for a 1.75 m character)")
-    contact_speed: FloatProperty(name="Speed Tolerance", default=0.45, min=0.05, max=3.0,
-                                 description="How still the contact point has to be (m/s for a 1.75 m character)")
+    contact_speed: FloatProperty(name="Speed Tolerance", default=0.15, min=0.02, max=3.0,
+                                 description="A planted foot may creep this fast at most (m/s for a 1.75 m character). "
+                                             "Faster, and it is stepping, however low it stays")
+    contact_travel: FloatProperty(name="Max Travel", default=0.03, min=0.0, max=0.5, unit="LENGTH",
+                                  description="A planted foot stays within this distance of one spot. A contact that goes "
+                                              "further is cut into the places where the foot rests (0 = do not check)")
+    pin_max_shift: FloatProperty(name="Max Correction", default=0.05, min=0.0, max=1.0, unit="LENGTH",
+                                 update=_solve_setting_update,
+                                 description="How far a detected plant may move a foot along the floor. A foot that would "
+                                             "have to be carried further was not planted: the pin gives way there and says "
+                                             "so. Pins you make yourself hold whatever it takes (0 = no limit)")
     contact_min_time: FloatProperty(name="Min Duration", default=0.1, min=0.03, max=1.0, unit="TIME_ABSOLUTE")
     contact_hands: BoolProperty(name="Hands", default=False, description="Also detect hands resting on the floor")
     pin_blend_in: IntProperty(name="Ease In", default=4, min=0, max=60)
@@ -341,7 +350,7 @@ def solve_settings(st: MCSettings, fps: float) -> SolveSettings:
     return SolveSettings(
         floor_z=st.floor_z, floor_object=st.floor_object.name if st.floor_object else "", use_floor=st.use_floor,
         floor_cushion=frames(st.floor_cushion), clip_hands=st.clip_hands, clip_toes=st.clip_toes,
-        flat_tolerance_deg=st.flat_tolerance, use_pins=st.use_pins,
+        flat_tolerance_deg=st.flat_tolerance, use_pins=st.use_pins, pin_max_shift=st.pin_max_shift,
         use_knee_fix=st.use_knee_fix, max_extension=st.max_extension, softness=st.softness,
         use_pelvis=st.use_pelvis, pelvis_max_drop=st.pelvis_max_drop, pelvis_smooth=frames(st.pelvis_smooth),
         pelvis_horizontal=st.pelvis_horizontal, use_heel_peel=st.use_heel_peel, heel_peel_max_deg=st.heel_peel_max,

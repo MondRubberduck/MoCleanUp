@@ -158,27 +158,75 @@ def _deadzone_swing(swing: np.ndarray, theta0: float) -> np.ndarray:
 # Contact detection
 # ---------------------------------------------------------------------------
 
+def windowed_velocity(points: np.ndarray, fps: float, window: float = 0.05) -> np.ndarray:
+    """Velocity in units per second, measured over ``+-window`` seconds (time on axis 0).
+
+    The same at any frame rate, and a millimetre of jitter does not read as centimetres per second
+    the way a frame-to-frame difference does at 60 or 120 fps.
+    """
+    T = len(points)
+    if T < 2:
+        return np.zeros_like(points, dtype=np.float64)
+    w = int(np.clip(round(window * fps), 1, T - 1))
+    pad = np.concatenate([np.repeat(points[:1], w, axis=0), points, np.repeat(points[-1:], w, axis=0)])
+    return (pad[2 * w :] - pad[: -2 * w]) * (fps / (2.0 * w))
+
+
+def soft_limit(d: np.ndarray, limit: float) -> np.ndarray:
+    """``d >= 0`` as it is up to half of ``limit``, then saturating smoothly (C1) towards ``limit``."""
+    half = 0.5 * limit
+    if half <= 0.0:
+        return d
+    return np.where(d <= half, d, half + half * np.tanh((d - half) / half))
+
+
+def pivot_motion(points: np.ndarray, floor: Floor, fps: float, tau_h: float, tau_v: float):
+    """What the part of a sole that is on the ground does.
+
+    A foot rolls from heel to ball and turns on its ball; neither is travel. So the motion of a
+    contact is the motion of the grounded sole point that moves least (``tau_h``, ``tau_v``: how
+    much higher / faster than the best one a point may be and still count).
+
+    Returns ``(height (T,), speed (T,), slip (T, 2))``: the lowest point above the floor, the speed
+    of the pivot and its path along the floor. The path is integrated from the velocity, so it does
+    not jump when the pivot changes from heel to ball.
+    """
+    h = points[..., 2] - floor.height(points)
+    vel = windowed_velocity(points, fps)
+    # Holding still: before this frame or after it. (A difference across the frame would count the
+    # last frames of a swing into the first frames of the plant, and every plant would come out short.)
+    T = len(points)
+    n = int(np.clip(round(0.1 * fps), 1, max(T - 1, 1)))           # a tenth of a second: jitter averages out
+    pad = np.concatenate([np.repeat(points[:1], n, axis=0), points, np.repeat(points[-1:], n, axis=0)])
+    ahead = np.linalg.norm(pad[2 * n :] - pad[n : n + T], axis=2)
+    behind = np.linalg.norm(pad[n : n + T] - pad[:T], axis=2)
+    ahead[T - n :] = np.inf                                        # nothing to compare with at the ends of the take
+    behind[:n] = np.inf
+    speed = np.minimum(ahead, behind) * (fps / n)
+    speed = np.where(np.isfinite(speed), speed, np.linalg.norm(vel, axis=2))
+    w = (np.exp(-(h - h.min(axis=1, keepdims=True)) / max(tau_h, 1e-9))
+         * np.exp(-(speed - speed.min(axis=1, keepdims=True)) / max(tau_v, 1e-9)))
+    w /= w.sum(axis=1, keepdims=True)
+    pv = np.sum(w[..., None] * vel, axis=1)
+    return h.min(axis=1), np.sum(w * speed, axis=1), np.cumsum(pv[:, :2], axis=0) / fps
+
+
 def contact_probability(points: np.ndarray, floor: Floor, fps: float, height_tol: float, speed_tol: float,
-                        with_stillness: bool = False):
+                        with_stillness: bool = False, with_slip: bool = False):
     """Per-frame plant probability from ``points (T, K, 3)`` of one end effector.
 
-    Cues: proximity of the lowest point to the floor, stationarity of the most stationary point
-    (the pivot: heel at strike, ball at toe-off) and vertical settling of the lowest point.
+    Planted means: at the floor, and the part that is on the ground holds still. Both are needed.
+    A plant may creep - that is the error to fix - but slowly; a foot that travels is stepping,
+    however low it stays (fighters and dancers slide their feet a centimetre above the floor).
+    With the thresholds of ``hysteresis_runs`` a contact starts below about 0.8 of ``speed_tol``
+    and ends above it.
     """
-    T = points.shape[0]
-    h = points[..., 2] - floor.height(points)
-    h_min = np.maximum(h.min(axis=1), 0.0)
-    vel = np.gradient(points, axis=0) * fps if T > 1 else np.zeros_like(points)
-    v_pivot = np.linalg.norm(vel, axis=2).min(axis=1)
-    vz = np.abs(np.gradient(h.min(axis=1))) * fps if T > 1 else np.zeros(T)
-    s_h = np.exp(-((h_min / max(height_tol, 1e-9)) ** 2))
-    s_v = np.exp(-((v_pivot / max(speed_tol, 1e-9)) ** 2))
-    s_vz = np.exp(-((vz / max(0.6 * speed_tol, 1e-9)) ** 2))
-    # A plant may slide - that is the error to fix - but a foot that travels at twice the tolerance
-    # is stepping, shuffling or running on the spot, however close to the floor it stays. (Without
-    # this, height and vertical stillness alone keep a contact alive once it has started.)
-    gate = np.exp(-((v_pivot / max(2.0 * speed_tol, 1e-9)) ** 4))
-    prob = s_h * (0.55 * s_v + 0.30 * s_vz + 0.15) * gate
+    h_min, speed, slip = pivot_motion(points, floor, fps, 0.125 * height_tol, 0.2 * speed_tol)
+    s_h = np.exp(-((np.maximum(h_min, 0.0) / max(height_tol, 1e-9)) ** 2))
+    s_v = np.exp(-((speed / max(speed_tol, 1e-9)) ** 2))
+    prob = s_h * s_v
+    if with_slip:
+        return prob, s_v, slip
     return (prob, s_v) if with_stillness else prob
 
 
@@ -197,15 +245,65 @@ def hysteresis_runs(prob: np.ndarray, on: float = 0.55, off: float = 0.35, max_g
     return [(s, e) for s, e in find_runs(mask) if e - s + 1 >= min_len]
 
 
+def split_by_travel(slip: np.ndarray, runs: list[tuple[int, int]], travel: float, min_len: int = 3,
+                    creep: float = 0.0) -> list[tuple[int, int]]:
+    """Cut contact runs so that each one is a foot resting at ONE place.
+
+    ``slip (T, 2)``: path of the grounded point (``pivot_motion``). A run whose path stays within
+    ``travel`` of its median is a plant, creep included. A run that leaves it holds more than one
+    place: it is cut into the spans where the foot rests, and the frames in which it goes from one
+    to the next are not a contact. A span that the foot merely passes through is not a rest either
+    (it is somewhere else at the end than at the start, or gets there faster than ``creep`` per
+    frame) - otherwise a slow step would come out as a staircase of little plants.
+    """
+    out: list[tuple[int, int]] = []
+
+    def rests(a: int, b: int) -> bool:
+        n = b - a + 1
+        q = max(1, n // 4)
+        net = np.linalg.norm(slip[b - q + 1 : b + 1].mean(axis=0) - slip[a : a + q].mean(axis=0))
+        return bool(net <= 0.5 * travel and (creep <= 0.0 or net <= creep * (n - q)))
+
+    def cut(s: int, e: int, natural_start: bool, natural_end: bool) -> None:
+        if e - s + 1 < min_len:
+            return
+        seg = slip[s : e + 1]
+        dev = np.linalg.norm(seg - np.median(seg, axis=0), axis=1)
+        if dev.max() <= travel:
+            if (natural_start and natural_end) or rests(s, e):
+                out.append((s, e))
+            return
+        # the place where the foot stays longest, re-centred on itself
+        a, b = max(find_runs(dev <= travel), key=lambda r: r[1] - r[0])
+        home = np.median(seg[a : b + 1], axis=0)
+        near = np.linalg.norm(seg - home, axis=1)
+        mid = (a + b) // 2
+        a2, b2 = next((r for r in find_runs(near <= travel) if r[0] <= mid <= r[1]), (a, b))
+        # where the run is cut the foot is on its way in or out: the plant begins after / ends before that
+        still = np.flatnonzero(near[a2 : b2 + 1] <= 0.4 * travel)
+        if len(still):
+            a3 = a2 if (a2 == 0 and natural_start) else a2 + int(still[0])
+            b3 = b2 if (b2 == len(seg) - 1 and natural_end) else a2 + int(still[-1])
+            if b3 - a3 + 1 >= min_len and rests(s + a3, s + b3):
+                out.append((s + a3, s + b3))
+        cut(s, s + a2 - 1, natural_start, False)
+        cut(s + b2 + 1, e, False, natural_end)
+
+    for s, e in runs:
+        cut(s, e, True, True)
+    return sorted(out)
+
+
 def detect_contacts(end_points: dict[str, np.ndarray], floor: Floor, f0: int, fps: float, unit: float = 1.0,
-                    height_tol: float = 0.04, speed_tol: float = 0.45, blend_in: int = 4, blend_out: int = 5,
-                    min_duration: float = 0.1) -> tuple[list[KinematicPin], dict[str, np.ndarray]]:
+                    height_tol: float = 0.04, speed_tol: float = 0.15, blend_in: int = 4, blend_out: int = 5,
+                    min_duration: float = 0.1, travel_tol: float = 0.03) -> tuple[list[KinematicPin], dict[str, np.ndarray]]:
     """Detect plants for every entry of ``end_points`` (``owner -> (T, K, 3)`` contact points).
 
     Tolerances are in metres / metres-per-second for a 1.75 m character and scaled by ``unit``.
-    Returns the pins and the per-owner probability curves.
+    ``travel_tol``: a planted foot stays within this distance of one spot (``split_by_travel``;
+    0 = do not check). Returns the pins and the per-owner probability curves.
     """
-    both = {o: contact_probability(p, floor, fps, height_tol * unit, speed_tol * unit, with_stillness=True)
+    both = {o: contact_probability(p, floor, fps, height_tol * unit, speed_tol * unit, with_slip=True)
             for o, p in end_points.items()}
     probs = {o: b[0] for o, b in both.items()}
     still = {o: b[1] for o, b in both.items()}
@@ -226,6 +324,8 @@ def detect_contacts(end_points: dict[str, np.ndarray], floor: Floor, f0: int, fp
     pins: list[KinematicPin] = []
     for owner, prob in probs.items():
         runs = hysteresis_runs(prob, max_gap=max_gap, min_len=min_len)
+        if travel_tol > 0.0:
+            runs = split_by_travel(both[owner][2], runs, travel_tol * unit, min_len, creep=0.4 * speed_tol * unit / fps)
         T = len(prob)
         for i, (s, e) in enumerate(runs):
             gap_before = s - (runs[i - 1][1] if i > 0 else -10 ** 6) - 1
@@ -276,49 +376,70 @@ def _auto_anchor_weights(pos: np.ndarray, li: int, lo: int, fps: float, unit: fl
 
 
 def _planted_foot(pos, quat, sole, forward_local, rest_quat, floor: Floor, li: int, lo: int, ref: int,
-                  fps: float, unit: float, lock_rotation: float, flat_tol: float, radius=None, up_local=None):
-    """Target trajectory of a planted foot: the lowest sole point stays put, heel / toe may roll.
+                  fps: float, unit: float, lock_rotation: float, flat_tol: float, radius=None, up_local=None,
+                  max_yaw: float | None = None):
+    """Target trajectory of a planted foot: the data, without the slip of the part that is on the ground.
 
-    Returns ``(target_pos, target_quat)`` for all frames (only meaningful inside the pin window).
+    A planted foot still rolls from heel to ball and turns on its ball. So the foot is not frozen in
+    one pose: the sole points that carry it (low, and holding still in the data) are kept from
+    sliding, and whatever the foot does around them stays. Small tilts are flattened, and the
+    heading is locked while the foot only wobbles.
+
+    ``max_yaw`` (radians, detected pins): a foot that turns further than this during the plant is
+    pivoting, and its turn is left alone.
+    Returns ``(target_pos, target_quat)`` for all frames (only meaningful around the pin).
     """
     T = len(pos)
     quat = quat_hemisphere_continuous(quat)[0]
-    tau = 0.0015 * unit
     seg = slice(li, lo + 1)
     wt = np.zeros(lo - li + 1) if ref >= 0 else _auto_anchor_weights(pos, li, lo, fps, unit)
     if ref >= 0:
         wt[int(np.clip(ref, li, lo)) - li] = 1.0
+    # floor heights: everywhere for a plane, around the pin for a terrain (a ray cast per point)
+    near = slice(0, T) if floor.is_plane else slice(max(li - 64, 0), min(lo + 64, T - 1) + 1)
 
-    # Plant orientation: sole flat, heading = weighted circular mean of the data heading.
+    def ground(points):
+        out = np.full(points.shape[:-1], floor.z)
+        out[near] = floor.height(points[near])
+        return out
+
+    # ---- which part of the sole carries the foot, and how far it slips in the data ---------------------
+    r_raw = sole_offsets(quat[:, None, :], sole[None, :, :], radius, up_local)     # (T, K, 3)
+    pts = pos[:, None, :] + r_raw
+    h = pts[..., 2] - ground(pts)
+    speed = np.linalg.norm(windowed_velocity(pts, fps), axis=2)
+    carry = (np.exp(-(h - h.min(axis=1, keepdims=True)) / (0.005 * unit))
+             * np.exp(-(speed - speed.min(axis=1, keepdims=True)) / (0.02 * unit)))
+    carry /= carry.sum(axis=1, keepdims=True)
+    step = np.zeros((T, 2))
+    step[1:] = np.sum((0.5 * (carry[1:] + carry[:-1]))[..., None] * (pts[1:, :, :2] - pts[:-1, :, :2]), axis=1)
+    slip = np.cumsum(step, axis=0)                 # frame by frame, so the pivot ends up exactly still
+    home = weighted_geometric_median(slip[seg], wt)
+
+    # ---- orientation: data = turn * tilt * plant ----------------------------------------------------------
+    # The tilt (heel strike, roll onto the ball) is the foot's own and is kept; small tilts are
+    # flattened. The turn about the vertical is locked to the heading of the plant.
     head = _heading(quat[seg], forward_local)
-    yaw = float(np.arctan2(np.sum(wt * np.sin(head)), np.sum(wt * np.cos(head))))
+    yaw_plant = float(np.arctan2(np.sum(wt * np.sin(head)), np.sum(wt * np.cos(head))))
     yaw_rest = float(_heading(rest_quat, forward_local))
-    q_plant = quat_multiply(quat_axis_angle(UP, np.array(yaw - yaw_rest)), rest_quat)
-    r_plant = sole_offsets(q_plant[None, :], sole, radius, up_local)   # (K, 3)
-
-    # Plant position: where the lowest sole point of the data sits, averaged over the stance.
-    pts = sole_points_world(pos[seg], quat[seg], sole, radius, up_local)   # (S, K, 3)
-    h = pts[..., 2] - floor.height(pts)
-    w_low = np.exp(-(h - h.min(axis=1, keepdims=True)) / tau)
-    w_low /= w_low.sum(axis=1, keepdims=True)
-    implied = np.sum(w_low[..., None] * (pts - r_plant[None]), axis=1)      # (S, 3)
-    p_plant = weighted_geometric_median(implied, wt)
-    anchors = p_plant[None, :] + r_plant                             # (K, 3)
-    anchors[:, 2] = floor.height(anchors)                            # sole on the floor
-
-    # Per-frame orientation: keep the data's tilt (heel strike / toe-off roll), flatten small
-    # tilts, lock (or partially free) the yaw.
+    q_plant = quat_multiply(quat_axis_angle(UP, np.array(yaw_plant - yaw_rest)), rest_quat)
     rel = quat_multiply(quat, quat_conjugate(q_plant)[None, :])
-    swing, twist = swing_twist(rel, UP)
-    swing = _deadzone_swing(swing, flat_tol)
-    twist = quat_exp(quat_log(twist) * (1.0 - float(np.clip(lock_rotation, 0.0, 1.0))))
-    q_d = quat_multiply(quat_multiply(swing, twist), q_plant[None, :])
-    r = sole_offsets(q_d[:, None, :], sole[None, :, :], radius, up_local)   # (T, K, 3)
-    hk = r[..., 2] - (anchors[None, :, 2] - anchors[:, 2].min())     # height of each point if the foot sat at z = 0
-    w = np.exp(-(hk - hk.min(axis=1, keepdims=True)) / tau)
-    w /= w.sum(axis=1, keepdims=True)
-    p_d = np.sum(w[..., None] * (anchors[None] - r), axis=1)
-    p_d[:, 2] = np.max(anchors[None, :, 2] - r[..., 2], axis=1)      # lowest point exactly on the floor
+    tilt_c, turn_c = swing_twist(quat_conjugate(rel), UP)             # rel^-1 = tilt^-1 * turn^-1
+    tilt = _deadzone_swing(quat_conjugate(tilt_c), flat_tol)
+    yaw = 2.0 * np.sum(quat_log(quat_conjugate(turn_c)) * UP, axis=-1)
+    lock = float(np.clip(lock_rotation, 0.0, 1.0))
+    if max_yaw is not None and max_yaw > 0.0:
+        lock *= float(np.clip((1.25 * max_yaw - np.abs(yaw[seg]).max()) / (0.5 * max_yaw), 0.0, 1.0))
+    turn = quat_axis_angle(UP, yaw * (1.0 - lock))
+    q_d = quat_multiply(quat_multiply(turn, tilt), q_plant[None, :])
+    r_d = sole_offsets(q_d[:, None, :], sole[None, :, :], radius, up_local)
+
+    # ---- position: the data without the slip; the carrying points stay where they are when the
+    # orientation changes; the lowest point of the sole exactly on the floor
+    p_d = pos + np.sum(carry[..., None] * (r_raw - r_d), axis=1)
+    p_d[:, :2] -= slip - home
+    low = p_d[:, None, :] + r_d
+    p_d[:, 2] += (ground(low) - low[..., 2]).max(axis=1)
     return p_d, q_d
 
 
@@ -326,10 +447,15 @@ def apply_pins(owner: str, pos: np.ndarray, quat: np.ndarray, pins: list[Kinemat
                unit: float, floor: Floor, sole: np.ndarray | None = None, forward_local: np.ndarray | None = None,
                rest_quat: np.ndarray | None = None, end_radius: float = 0.0, targets: dict | None = None,
                flat_tol: float = np.radians(4.0), sole_radius: np.ndarray | None = None,
-               up_local: np.ndarray | None = None):
+               up_local: np.ndarray | None = None, max_shift: float = 0.0, max_yaw: float | None = None,
+               notes: list | None = None):
     """Apply all enabled pins of one owner to its world trajectory.
 
     ``targets``: ``{(object name, bone name): world matrices (T, 4, 4)}`` for ``TARGET`` pins.
+    ``max_shift`` (world units, 0 = no limit) / ``max_yaw``: how far a *detected* floor pin may move
+    a foot along the floor / turn it. Detection can be wrong; a pin that would have to carry the
+    foot further gives way there, and says so in ``notes`` (``(pin, distance, first, last frame)``).
+    Pins made by hand hold whatever it takes.
     Returns ``(pos, quat, pin_weight (T,), planted_weight (T,), report)``.
     """
     T = len(pos)
@@ -351,8 +477,18 @@ def apply_pins(owner: str, pos: np.ndarray, quat: np.ndarray, pins: list[Kinemat
 
         if pin.mode == "FLOOR" and sole is not None and len(sole):
             p_t, q_t = _planted_foot(pos, quat, sole, forward_local, rest_quat, floor, li, lo, ref, fps, unit,
-                                     pin.lock_rotation, flat_tol, sole_radius, up_local)
+                                     pin.lock_rotation, flat_tol, sole_radius, up_local,
+                                     max_yaw=max_yaw if pin.auto else None)
             rot_amount = 1.0
+            if pin.auto and max_shift > 0.0:
+                d = p_t[:, :2] - pos[:, :2]
+                far = np.linalg.norm(d, axis=1)
+                keep = np.where(far > 1e-12, soft_limit(far, max_shift) / np.maximum(far, 1e-12), 1.0)
+                p_t = p_t.copy()
+                p_t[:, :2] = pos[:, :2] + d * keep[:, None]
+                over = np.flatnonzero(far[li : lo + 1] > 0.75 * max_shift)
+                if len(over) and notes is not None:
+                    notes.append((pin, float(far[li : lo + 1].max()), f0 + li + int(over[0]), f0 + li + int(over[-1])))
         elif pin.mode in ("FLOOR", "WORLD"):
             if ref >= 0:
                 a_pos, a_quat = pos[ref].copy(), quat[ref].copy()

@@ -320,6 +320,8 @@ def _draw_pins(layout, context, st, rig):
     col.label(text="Detection")
     col.prop(st, "contact_height")
     col.prop(st, "contact_speed")
+    col.prop(st, "contact_travel")
+    col.prop(st, "pin_max_shift")
     col.prop(st, "contact_min_time", text="Min Duration (s)")
     col.prop(st, "contact_hands")
     col.prop(st, "pin_blend_in")
