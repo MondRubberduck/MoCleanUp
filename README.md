@@ -35,8 +35,8 @@ back the whole take, a frame range, or only the selected bones.
 | **2 Filter** | Jitter | Whittaker, Modified Sinc, zero-phase Butterworth, B-spline or 1 Euro. All are set by a cutoff in Hz; **Suggest Cutoff** runs a residual analysis. Rotations are filtered on SO(3), never per channel. *Only Where Needed* limits the filter to frames flagged as noisy. *Max Change* (2 cm by default) is the most the filter may move a control: noise is small, so anything larger would be a punch, a landing or a snap being rounded off. |
 | **3 Drift** | Slow sliding of the whole body, invisible stairs, loops that do not close | Zero-velocity updates at planted feet, floor levelling per step, loop closure with matching pose and velocity. Meant for inertial suits and video capture. |
 | **4 Pins** | Sliding feet, hands that should hold on to something, limbs below the floor | Kinematic Pins (see below), automatic contact detection, floor clipping for soles, toes and wrists. |
-| **5 Body** | Knee and elbow pops, IK snapping at full stretch, pole flips, jumps that ignore gravity, hands inside the body | Soft IK with a shared reach limit, the pelvis gives way for planted legs, optional heel peel, pole targets re-aimed and de-spiked, ballistic flight arcs for the centre of mass, capsule push-out. |
-| **6 Keys** | Thousands of keys per bone | Error-bounded sparse Bezier keys. What the sparse curves do not reproduce goes to a residual layer on an NLA track, so the result is still the cleaned motion and the keys are editable. |
+| **5 Body** | Knee and elbow pops, IK snapping at full stretch, pole flips, jumps that ignore gravity, hands inside the body | The reach the take has is the reference: only what an edit adds, a target the limb cannot reach and measured pops are softened, so a straight leg stays straight. A foot below the floor under a straight leg raises the body instead of bending the knee. The hips give way only for pins made by hand, pops, or targets out of reach. Optional heel peel, pole targets re-aimed and de-spiked, ballistic flight arcs for the centre of mass, capsule push-out. |
+| **6 Keys** | Thousands of keys per bone | Error-bounded sparse Bezier keys. Optionally (*Residual Detail Layer*, off by default) what the sparse curves do not reproduce goes to an NLA track; other tools that read the action (re-bakes, retargeting, export) leave that track behind. |
 
 ### Pins
 
@@ -50,7 +50,9 @@ either side.
 
 Select a control (`foot_ik.L`, `hand_ik.R`, `torso`, or any bone of that limb), go to the first frame of
 the contact and press **Pin Here**. **Detect Contacts** creates floor pins for every foot plant it
-finds. Pins appear as bars in the Dope Sheet: drag the body to move a pin, an edge to change the
+finds. A foot that travels is not planted: a contact ends where the grounded part of the foot moves
+more than *Max Travel* (3 cm), so slow sliding steps stay steps. A detected pin moves a foot at most
+*Max Correction* (5 cm) along the floor and says where it gave way; pins made by hand hold whatever it takes. Pins appear as bars in the Dope Sheet: drag the body to move a pin, an edge to change the
 locked span, a ramp to change the ease. An arm that is animated in FK is switched to IK inside the
 pin and back afterwards.
 
@@ -59,15 +61,36 @@ at which frames.
 
 ### Floor
 
-By default the floor is where the feet rest in the take (*Floor from Feet*), so a take that floats a few
-centimetres above the grid still gets planted. Turn it off to set a height by hand, or choose a mesh as
-**Terrain** for uneven ground.
+*Floor Height* is the floor the character stands on: the grid (0) by default. With **Feet on Floor** (on by
+default) Clean Up Take raises or lowers the whole take by one amount, on the rig's root control, so that
+the resting feet stand on that floor, and says how far ("take raised 3.3 cm onto the floor"). The motion
+itself does not change, and "Largest change" leaves this shift out. Turn it off to leave the take where it
+is; feet below the floor are still lifted.
+
+The feet are measured on the character mesh: a rig built for a game skeleton has its sole points 2-3 cm
+above the shoe. MoCap Cleanup finds the meshes deformed by the rig (also through a skeleton constrained
+to it), measures how far the mesh rests below the rig's sole points ("mesh sole 2.6 cm below the rig's"),
+and keeps the rig's soles that much above the floor. Choose a mesh as **Terrain** for uneven ground.
 
 ### Solve
 
 Stages 4 and 5 share one solver. It always starts from the motion as it was before the last solve, so
 moving a pin or changing a setting never stacks corrections. **Remove Solve** takes its result off the
 curves; the pins stay.
+
+### Both chains of a limb
+
+A take baked onto a control rig (Rig Bridge, a retargeter) often has the IK *and* the FK controls keyed,
+so the IK/FK switch works on every frame. When both chains arrive in agreement, MoCap Cleanup keeps them
+together after every edit: where IK is active the FK controls follow the result, where FK is active the
+IK control and pole follow it. The chain that is never active is not analysed. Limbs whose chains do
+not agree to begin with are left as they are.
+
+### Which rig
+
+Select the control rig, or the character mesh, or the game skeleton: a mesh stands for its armature, and
+a skeleton driven by another armature's constraints stands for that rig (cleaning the skeleton's own
+action would change nothing that is seen).
 
 ## Overlays
 
@@ -95,6 +118,9 @@ curves; the pins stay.
 * Ballistic jump correction is off by default; it moves the whole body and wants a look afterwards.
 * Fingers and faces are filtered and reduced like every other bone, but there is no dedicated tool
   for them.
+* A full **Restore Raw** brings back the take exactly and forgets the snapshot and the solve; helper
+  actions whose take was deleted or replaced by another tool are removed when the file is loaded.
+* **Fix This Issue** says so when there is nothing to repair (a lasting step in the take is not a glitch).
 
 ## Tests
 
