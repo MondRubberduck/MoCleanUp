@@ -1,4 +1,49 @@
-# Handoff: response to the QA pass (state of 2026-11-12, evening)
+# Handoff: response to the QA pass
+
+## State after session 2 (2026-11-12, night) - read this first
+
+All twelve rows are done and committed locally (nothing pushed, nothing released). The chain was re-run
+on the full 5755-frame take with the fixed add-ons; both characters pass every limit of `tests/harm.py`.
+What is left is the user's GUI test (row 12, second half).
+
+| Repo | Commits (oldest first) |
+|---|---|
+| Rig Bridge `C:\Users\kondi\Documents\BlenderAddons\rig_bridge` (git, remote MondRubberduck/Rig-Bridge) | `2c9e74d` IK bake O(N) + roll (R1, R5) · `4b2699a` keep an edited take (I2) · `42dbc80` copies, NLA on rebuild, names, docs (I3, I5, R2-R4) |
+| Bulletproof Retarget `...\GIT_Folder\Bulletproof-Retarget` | `a73fadf` Rig Bridge copies, hidden helpers, ignored NLA, README (I3, I7, I6, B1, B3) |
+| MoCap Cleanup (this repo) | `5d1585e` floor (M3) · `6a90ed6` IK follows FK on FK limbs (I1 arms) · `019542c` rig behind a selection, honest Fix, pin check, idle chains (I4, M4, M7, M5) · `344d928` snapshots/helpers/result line/residual opt-in · `27e6751` fewer sampling passes · `501749c` README |
+
+Full take, one click (Optical preset), Mixamo / UE5 character, through Rig Bridge + BP Retarget:
+
+| | QA pass (before) | Now |
+|---|---|---|
+| Retarget + Bake to Control Rig | 32.4 / 48.4 min | 4.1 / 6.1 min |
+| Largest change | Foot 62 / 78 cm | Knee 4.3 / 6.5 cm |
+| Foot carried sideways, max | 62 / 76 cm | 3.0 / 3.5 cm |
+| Knee pops flagged before -> after | 0 -> 31 / 1 -> 48 | 0 -> 0 / 1 -> 0 |
+| IK vs FK after cleanup, legs / arms | 63-78 cm / 8.4 cm | 0.00 / 0.01 cm |
+| Mesh vs floor (planted frames) | -1.5 / -3.2 cm | -0.05 / -0.04 cm |
+| IK roll flips (straight limbs) | 8 % of frames | 0 |
+| Clean Up Take, 5755 frames | 36-47 s | 117 / 128 s measured before `27e6751`, which takes about 30 % off (measured on 1051 frames); not re-measured on the full take |
+
+Tests: MoCap 66/66 (5.3); Rig Bridge `test_rig_bridge` 39/39 and `test_standards` 142/142; BPR
+`test_standards` and `test_fbx_bone_axes` pass; scenario checks per row in `tests/dev/session2/`.
+Install zips of all three (built from the local commits): `C:\Users\kondi\Desktop\Add_ON_Test\builds_2026-11-12_local_commits`.
+Result file: `C:\Users\kondi\Desktop\Add_ON_Test\Test_AddOn_Collection_v2_Result.blend`.
+
+Notes worth keeping:
+* R1 root cause: inserting a key and then evaluating makes Blender copy the whole (already FK-baked) action;
+  1.4 ms with 5 k keys, 53 ms with 4.2 M keys, about 10 times per frame. Collect, then write once.
+* R5 also had a second cause: the pole correction followed a slightly over-straight knee and rolled the IK
+  chain 180 degrees to match it. Such joints now come out straight in IK (documented).
+* Floor: the solve reshapes feet (flattens plants, lifts toes), so the mesh offset measured on the raw take is
+  stale afterwards; the take settles once more after the solve (`settle_on_floor`).
+* The arm IK/FK desync (0.3-0.8 cm) existed before session 2; row 4 covered IK-active limbs only.
+* `tests/harm.py` now judges the mesh on frames inside floor pins; the all-frames median is still printed.
+* Not done: GUI run of the panels (new props: Feet on Floor, Floor Height always editable); Blender 5.2 GUI.
+
+---
+
+# Session 1 (state of 2026-11-12, evening)
 
 Read this first, then `HANDOFF.md` (architecture) and the QA report itself:
 `C:\Users\kondi\Desktop\MoCap Chain QA.md` and `C:\Users\kondi\Desktop\Add_ON_Test\QA_Report.md`
@@ -53,14 +98,14 @@ Rebuild before the user tests: `blender -c extension build --source-dir <repo> -
 | 2 | MoCap | M1 | Contact pins erased steps | **done** `f9488c4` |
 | 3 | MoCap | M2 | Knee guard bent straight legs | **done** `2bad3cc` |
 | 4 | MoCap | I1 | IK and FK chain out of sync after cleanup | **done** `91c19a9` |
-| 5 | MoCap | M3 | Floor: grid + constant shift; sole from the character mesh | open |
-| 6 | MoCap | I4, M4, M7, M5 | Resolve mesh/skeleton to the control rig; honest "could not repair"; check before adding a pin; ignore controls with no influence | open |
-| 7 | MoCap | own | Drop the stale snapshot and orphaned helpers; residual layer off by default (I5, I6) | open |
-| 8 | Rig Bridge | I2 | Keep an edited bake; write the new one under a new name | open |
-| 9 | Rig Bridge | R1, R5 | IK bake: sample once, write once; straight limbs take their roll from the FK chain | open |
-| 10 | Rig Bridge | I3, I5, R2-R4 | Ownership check for duplicates; carry NLA tracks over on rebuild; naming and docs | open |
-| 11 | BPR | I7, I3, B1, I6, B3 | Skip dot-prefixed helper actions; bake only when the skeleton is driven by that rig; README | open |
-| 12 | all | | Re-run the chain on the full take, then the user's GUI test | open |
+| 5 | MoCap | M3 | Floor: grid + constant shift; sole from the character mesh | **done** `5d1585e` |
+| 6 | MoCap | I4, M4, M7, M5 | Resolve mesh/skeleton to the control rig; honest "could not repair"; check before adding a pin; ignore controls with no influence | **done** `019542c` (+ `6a90ed6` arms) |
+| 7 | MoCap | own | Drop the stale snapshot and orphaned helpers; residual layer off by default (I5, I6) | **done** `344d928` |
+| 8 | Rig Bridge | I2 | Keep an edited bake; write the new one under a new name | **done** `4b2699a` |
+| 9 | Rig Bridge | R1, R5 | IK bake: sample once, write once; straight limbs take their roll from the FK chain | **done** `2c9e74d` |
+| 10 | Rig Bridge | I3, I5, R2-R4 | Ownership check for duplicates; carry NLA tracks over on rebuild; naming and docs | **done** `42dbc80` |
+| 11 | BPR | I7, I3, B1, I6, B3 | Skip dot-prefixed helper actions; bake only when the skeleton is driven by that rig; README | **done** `a73fadf` |
+| 12 | all | | Re-run the chain on the full take, then the user's GUI test | full take **done** (all limits hold); GUI test open |
 
 Targets for one click with default settings on the full take: no pin moves a foot more than the cap; hips
 lowered under 1 cm (p95); no more knee pops flagged than before; IK/FK mismatch under 0.5 cm before
