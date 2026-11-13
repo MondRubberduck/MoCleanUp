@@ -207,6 +207,7 @@ def run_analyze(context, rig):
             item.name = it.label
             item.kind, item.frame_start, item.frame_end = it.kind, it.frame_start, it.frame_end
             item.bone, item.severity, item.message = it.bone, it.severity, it.message
+            item.idle = it.idle
         data.active_issue = min(data.active_issue, max(len(data.issues) - 1, 0))
     data.analysis_summary = report.summary()
     data.analysis_stale = False

@@ -109,27 +109,31 @@ def _draw_marks(context, region, rig, st, selected_only: bool = False) -> None:
     selected = set(action_io.selected_pose_bone_names(rig)) if (st.marks_only_selected or selected_only) else None
     s = pin_tracks.ui_scale(context)
     h = region.height
-    by_kind: dict[str, list] = {}
-    strong: dict[str, list] = {}
+    by_kind: dict[tuple, list] = {}
+    strong: dict[tuple, list] = {}
     active = data.active_issue
     outline = None
+    show_idle = st.show_idle_issues
     for i, issue in enumerate(data.issues):
-        if not _visible_issue(issue, selected):
+        if not _visible_issue(issue, selected) or (issue.idle and not show_idle):
             continue
         xa = x0 + per_frame * (issue.frame_start - 0.5)
         xb = x0 + per_frame * (issue.frame_end + 0.5)
         if xb < 0 or xa > region.width:
             continue
         xb = max(xb, xa + 2.0)
-        by_kind.setdefault(issue.kind, []).append((xa, 0.0, xb, h))
-        strong.setdefault(issue.kind, []).append((xa, 0.0, xb, 5.0 * s))
+        key = (issue.kind, bool(issue.idle))
+        by_kind.setdefault(key, []).append((xa, 0.0, xb, h))
+        strong.setdefault(key, []).append((xa, 0.0, xb, 5.0 * s))
         if i == active:
             outline = (xa, xb)
     stale = 0.55 if data.analysis_stale else 1.0
-    for kind, rects in by_kind.items():
-        c = ISSUE_COLORS.get(kind, (1.0, 1.0, 1.0))
-        _rects(rects, (*c, 0.13 * stale))
-        _rects(strong[kind], (*c, 0.95 * stale))
+    for key, rects in by_kind.items():
+        kind, idle = key
+        c = (0.55, 0.55, 0.55) if idle else ISSUE_COLORS.get(kind, (1.0, 1.0, 1.0))
+        dim = 0.45 if idle else 1.0                          # a control that does not move the character there
+        _rects(rects, (*c, 0.13 * stale * dim))
+        _rects(strong[key], (*c, 0.95 * stale * dim))
     if outline is not None:
         xa, xb = outline
         _lines([(xa, 0), (xa, h), (xb, 0), (xb, h)], (1.0, 1.0, 1.0, 0.55), 1.0)

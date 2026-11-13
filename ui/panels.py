@@ -38,6 +38,7 @@ def _wrapped(layout, context, text: str, icon: str = "NONE") -> None:
 class MOCAP_UL_issues(UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         row = layout.row(align=True)
+        row.active = not item.idle                   # on a control that does not move the character there
         row.label(text="", icon=ISSUE_ICONS.get(item.kind, "DOT"))
         frames = f"{item.frame_start}" if item.frame_start == item.frame_end else f"{item.frame_start}-{item.frame_end}"
         sub = row.row()
@@ -48,12 +49,13 @@ class MOCAP_UL_issues(UIList):
 
     def filter_items(self, context, data, propname):
         items = getattr(data, propname)
-        flt = [self.bitflag_filter_item] * len(items)
+        show_idle = context.scene.mocap_cleanup.show_idle_issues
+        flt = [self.bitflag_filter_item if (show_idle or not it.idle) else 0 for it in items]
         if self.filter_name:
             needle = self.filter_name.lower()
-            flt = [self.bitflag_filter_item if (needle in it.message.lower() or needle in it.kind.lower()
-                                                or needle in ISSUE_NAMES.get(it.kind, "").lower()) else 0
-                   for it in items]
+            flt = [f if (needle in it.message.lower() or needle in it.kind.lower()
+                         or needle in ISSUE_NAMES.get(it.kind, "").lower()) else 0
+                   for f, it in zip(flt, items)]
         return flt, []
 
 
@@ -144,7 +146,9 @@ def _draw_diagnose(layout, context, st, rig):
             sub.label(text="Out of date - analyze again", icon="TIME")
         text = data.analysis_summary
         for part in [p.strip() for p in text.split(",")]:
-            sub.label(text=part)
+            line = sub.row()
+            line.active = "unused controls" not in part     # not counted: they do not move the character
+            line.label(text=part)
         if data.suggested_cutoff > 0.0:
             sub.label(text=f"Suggested filter cutoff: {data.suggested_cutoff:.1f} Hz")
         rest = data.floor_estimate - data.sole_offset
@@ -155,6 +159,9 @@ def _draw_diagnose(layout, context, st, rig):
             row.operator("mocap.floor_from_feet", text="Use")
     if len(data.issues):
         layout.template_list("MOCAP_UL_issues", "", data, "issues", data, "active_issue", rows=6)
+        n_idle = sum(1 for it in data.issues if it.idle)
+        if n_idle:
+            layout.prop(st, "show_idle_issues", text=f"Show {n_idle} on Unused Controls")
         if 0 <= data.active_issue < len(data.issues):
             issue = data.issues[data.active_issue]
             fix = s1.ISSUE_FIX.get(issue.kind, "")

@@ -174,6 +174,7 @@ class MCIssue(PropertyGroup):
     bone: StringProperty()
     severity: FloatProperty()
     message: StringProperty()
+    idle: BoolProperty()             # on a control that does not move the character there
 
 
 def _issue_index_update(self, context):
@@ -287,6 +288,11 @@ class MCSettings(PropertyGroup):
     pin_position: BoolProperty(name="Position", default=True, description="Hold its position (iClone: Pinning Move)")
     pin_rotation: BoolProperty(name="Rotation", default=True, description="Hold its rotation (iClone: Pinning Rotate)")
     show_contact_settings: BoolProperty(name="Contact Detection Settings", default=False)
+    show_idle_issues: BoolProperty(
+        name="Show Unused Controls", default=False, update=_redraw_update,
+        description="Also show problems on controls that do not move the character where they are (the IK "
+                    "controls of a limb that is in FK, the FK controls of one in IK, a pole target that is switched "
+                    "off), dimmed. They are not counted either way")
     use_pins: BoolProperty(name="Pins", default=True, update=_solve_setting_update)
     use_floor: BoolProperty(name="Floor Clipping", default=True, update=_solve_setting_update,
                             description="Soles, toes and wrists never dip below the floor")

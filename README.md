@@ -98,6 +98,12 @@ not agree to begin with (at the hand or foot) are left as they are. An IK chain 
 elbow backwards: where the take has one over-straight, the rig's IK bends it forwards by the same angle,
 and after the cleanup the FK chain follows that too.
 
+Where the chains do not agree, the idle one is still analysed, but a problem on a control that does not
+move the character on its frames (the IK controls and pole of a limb in FK, the FK controls of one in IK,
+the rotation of a pole target, a pole that is switched off) is not counted, not drawn and skipped by
+`[` / `]`; the summary ends with "164 more on unused controls". **Show Unused Controls** under the issue
+list brings them back, dimmed. On a typical Rig Bridge take with FK arms that was 164 of 201 issues.
+
 ### Which rig
 
 Select the control rig, or the character mesh, or the skeleton: a mesh stands for its armature, and
@@ -156,7 +162,7 @@ no heel bone: the sole is estimated from the ankle and the toes.
 tests/run.sh "/path/to/blender"
 ```
 
-Eleven headless test files (76 tests) on a generated Rigify human and a plain skeleton baked from it,
+Eleven headless test files (77 tests) on a generated Rigify human and a plain skeleton baked from it,
 plus a static name check. See
 `HANDOFF.md` for the layout of the code and for what a GUI session is needed to verify.
 

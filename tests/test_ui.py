@@ -306,6 +306,58 @@ def test_editor_track_rows():
         assert hasattr(bpy.ops.mocap, op) and getattr(bpy.ops.mocap, op).get_rna_type() is not None
 
 
+def test_unused_controls_are_left_out():
+    """A problem on a control that does not move the character there (the FK controls of an arm in IK) is not
+    counted, not drawn and skipped by [ and ]; with Show Unused Controls it is listed and drawn dimmed (GUI
+    feedback: the arm IK poles of a take whose arms are in FK filled the track with flips)."""
+    from mocap_cleanup.overlays import editor_track
+    rig, gt, st = ta.make_scene(n_frames=90)
+    f0, f1 = gt["f0"], gt["f1"]
+    ch = action_io.read_bone_local_channels(rig, "upper_arm_fk.L", f0, f1)       # the arm is in IK
+    q = ch["quat"].copy()
+    q[40] = (0.7, 0.7, 0.0, 0.14)
+    action_io.write_bone_local_channels(rig, "upper_arm_fk.L", f0, quat=q / np.linalg.norm(q, axis=1, keepdims=True))
+    assert bpy.ops.mocap.analyze() == {"FINISHED"}
+    data = rig.mocap_cleanup
+    idle = [i for i, it in enumerate(data.issues) if it.idle]
+    live = [i for i, it in enumerate(data.issues) if not it.idle]
+    assert idle and live
+    hit = [data.issues[i] for i in idle if data.issues[i].bone == "upper_arm_fk.L"]
+    assert hit and hit[0].frame_start <= f0 + 40 <= hit[0].frame_end, [(it.bone, it.kind) for it in data.issues]
+    assert "- not in use here: the arm is in IK" in hit[0].message
+    assert all(data.issues[i].bone.endswith("_fk.L") or data.issues[i].bone.endswith("_fk.R") for i in idle)
+    assert any(data.issues[i].bone == "hand_ik.L" for i in live)                 # the spike that is seen
+    assert data.analysis_summary.endswith(f", {len(idle)} more on unused controls"), data.analysis_summary
+
+    class V2D:
+        def region_to_view(self, x, y):
+            return (f0 - 2 + x * (gt["T"] + 4) / 1000.0, y)
+
+    class Region:
+        view2d, width, height = V2D(), 1000, 400
+
+    def bands():
+        return {b["index"]: b for b in editor_track.layout(bpy.context, Region(), rig)["bands"]}
+
+    st.show_idle_issues = False
+    shown = bands()
+    assert not (set(idle) & set(shown)) and set(live) <= set(shown)
+    st.stage = "DIAGNOSE"
+    stats = draw_panel(panels._MainPanel)
+    assert "show_idle_issues" in stats["props"]
+    # [ and ] only visit what is seen
+    visited = set()
+    bpy.context.scene.frame_set(f0)
+    for _ in range(len(live) + 2):
+        assert bpy.ops.mocap.issue_jump(direction=1) == {"FINISHED"}
+        visited.add(data.active_issue)
+    assert visited <= set(live)
+    st.show_idle_issues = True
+    shown = bands()
+    assert set(idle) <= set(shown) and all(shown[i]["idle"] for i in idle)
+    st.show_idle_issues = False
+
+
 def test_view_mapping_is_exact():
     """Tracks and marks sit on their frames at any zoom and pan (GUI feedback: they slid, collapsed onto
     frame 0 or vanished, because the scale came from two neighbouring frames in whole pixels)."""
@@ -339,4 +391,4 @@ def test_view_mapping_is_exact():
 
 if __name__ == "__main__":
     run_tests([test_every_panel_layout, test_workspace_layout, test_overlays_render, test_view_mapping_is_exact,
-               test_editor_track_rows])
+               test_editor_track_rows, test_unused_controls_are_left_out])

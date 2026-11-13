@@ -2,7 +2,8 @@
 
 Drawn into a Dope Sheet that shows no channels (see ``ui.editor``), so the frame ruler, scrubbing, zoom and
 pan are Blender's own. Bands use the issue colours of the heat map; the labels and row plates use the
-theme of the Dope Sheet, so the track looks like the editor it is drawn in.
+theme of the Dope Sheet, so the track looks like the editor it is drawn in. Problems on controls that do not
+move the character there (``Issue.idle``) are left out, or drawn dimmed with *Show Unused Controls*.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ KIND_LABELS = {
     "FROZEN": "Dropout", "PENETRATION": "Below floor", "SKATE": "Foot slide",
 }
 _FINGERS = ("finger", "thumb", "palm", "f_index", "f_middle", "f_ring", "f_pinky")
+IDLE_COLOR = (0.55, 0.55, 0.55)
 
 
 def group_of(profile, bone_name: str) -> str:
@@ -57,8 +59,11 @@ def layout(context, region, rig) -> dict:
     x0, sx, _y0, _sy = pin_tracks.view_mapping(region)
     row_h, gap = 18.0 * s, 3.0 * s
     top = region.height - 30.0 * s                    # below the frame ruler
+    show_idle = context.scene.mocap_cleanup.show_idle_issues
     keys = {}
     for i, issue in enumerate(data.issues):
+        if issue.idle and not show_idle:
+            continue
         keys.setdefault(group_of(profile, issue.bone), []).append(i)
     rows, bands = [], []
     for g, _label in GROUPS:
@@ -74,7 +79,7 @@ def layout(context, region, rig) -> dict:
             xa = x0 + sx * (issue.frame_start - 0.5)
             xb = max(x0 + sx * (issue.frame_end + 0.5), xa + 2.0)
             bands.append({"index": i, "kind": issue.kind, "x0": xa, "x1": xb, "y0": y0 + 2.0 * s, "y1": y1 - 2.0 * s,
-                          "severity": float(issue.severity)})
+                          "severity": float(issue.severity), "idle": bool(issue.idle), "group": g})
     return {"rows": rows, "bands": bands, "label_w": 64.0 * s, "scale": s}
 
 
@@ -119,6 +124,8 @@ def draw(context, region, rig, rects, lines, text) -> None:
             continue
         c = ISSUE_COLORS.get(b["kind"], (0.8, 0.8, 0.8))
         a = round((0.45 + 0.5 * min(max(b["severity"], 0.0), 1.0)) * stale, 2)
+        if b["idle"]:
+            c, a = IDLE_COLOR, round(0.4 * stale, 2)        # not in use there: a grey hint, not a problem colour
         by_color.setdefault((*c, a), []).append((b["x0"], b["y0"], b["x1"], b["y1"]))
         if b["index"] == data.active_issue:
             active = b
@@ -128,16 +135,18 @@ def draw(context, region, rig, rects, lines, text) -> None:
         xa, xb, ya, yb = active["x0"], active["x1"], active["y0"], active["y1"]
         lines([(xa, ya), (xb, ya), (xb, ya), (xb, yb), (xb, yb), (xa, yb), (xa, yb), (xa, ya)], (1.0, 1.0, 1.0, 0.95), 1.5)
     rects([(0.0, y0, lay["label_w"], y1) for _g, y0, y1 in lay["rows"]], plate)
+    live = {b["group"] for b in lay["bands"] if not b["idle"]}
     for g, y0, y1 in lay["rows"]:
-        text(6.0 * s, y0 + 5.0 * s, GROUP_LABELS.get(g, g), 11.0 * s, txt)
+        text(6.0 * s, y0 + 5.0 * s, GROUP_LABELS.get(g, g), 11.0 * s, txt if g in live else (*txt[:3], 0.45))
     # legend: the kinds that occur, right-aligned along the bottom edge
-    kinds = [k for k in KIND_LABELS if any(b["kind"] == k for b in lay["bands"])]
+    kinds = [k for k in KIND_LABELS if any(b["kind"] == k and not b["idle"] for b in lay["bands"])]
+    entries = [(KIND_LABELS[k], (*ISSUE_COLORS.get(k, (0.8, 0.8, 0.8)), 0.95)) for k in kinds]
+    if any(b["idle"] for b in lay["bands"]):
+        entries.append(("Control not in use", (*IDLE_COLOR, 0.8)))
     x = region.width - 8.0 * s
     y = 20.0 * s
-    if True:
-        for k in reversed(kinds):
-            label = KIND_LABELS[k]
-            w = (len(label) * 6.2 + 18.0) * s
-            x -= w
-            rects([(x, y, x + 9.0 * s, y + 9.0 * s)], (*ISSUE_COLORS.get(k, (0.8, 0.8, 0.8)), 0.95))
-            text(x + 13.0 * s, y + 1.0 * s, label, 10.0 * s, txt)
+    for label, col in reversed(entries):
+        w = (len(label) * 6.2 + 18.0) * s
+        x -= w
+        rects([(x, y, x + 9.0 * s, y + 9.0 * s)], col)
+        text(x + 13.0 * s, y + 1.0 * s, label, 10.0 * s, txt)

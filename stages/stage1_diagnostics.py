@@ -68,6 +68,8 @@ class Issue:
     bone: str = ""                 # control whose curves show the problem ("" = whole body)
     severity: float = 0.5          # 0..1
     message: str = ""
+    idle: bool = False             # on a control that does not move the character there (see control_influence)
+    part: str = ""                 # 'loc' | 'rot' | '' : the channels that show it
 
     @property
     def label(self) -> str:
@@ -98,14 +100,21 @@ class DiagnosticReport:
     def T(self) -> int:
         return self.f1 - self.f0 + 1
 
-    def count(self, kind: str) -> int:
-        return sum(1 for i in self.issues if i.kind == kind)
+    def count(self, kind: str, live_only: bool = False) -> int:
+        return sum(1 for i in self.issues if i.kind == kind and not (live_only and i.idle))
+
+    @property
+    def idle_count(self) -> int:
+        return sum(1 for i in self.issues if i.idle)
 
     def summary(self) -> str:
-        if not self.issues:
-            return "No problems found"
-        parts = [f"{self.count(k)} {ISSUE_LABELS[k].lower()}" for k in ISSUE_LABELS if self.count(k)]
-        return ", ".join(parts)
+        """What is wrong with the motion that is seen. Problems on controls that do not move the character
+        (the IK controls of an arm in FK, ...) are only counted at the end."""
+        idle = self.idle_count
+        parts = [f"{self.count(k, True)} {ISSUE_LABELS[k].lower()}" for k in ISSUE_LABELS if self.count(k, True)]
+        if idle:
+            parts.append(f"{idle} more on unused controls" if parts else f"No problems found ({idle} on unused controls)")
+        return ", ".join(parts) if parts else "No problems found"
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +272,64 @@ def outlier_scores(x: np.ndarray, floor: float, spike_z: float = 6.5, max_spike_
 # Analysis
 # ---------------------------------------------------------------------------
 
+def control_influence(rig, profile, f0: int, f1: int) -> tuple[dict[str, np.ndarray], dict[str, str]]:
+    """How much each IK / FK control of a Rigify limb moves the character, per frame (0..1), and why not.
+
+    The IK controls of a limb act where its IK/FK switch is below 1, the FK controls where it is above 0, a
+    pole target only while the limb's pole is switched on. A problem on a control that does nothing there is
+    not seen (GUI feedback: the arm IK poles of a take whose arms are in FK filled the track with flips)."""
+    from ..core.chain_sync import fk_chain
+    weight: dict[str, np.ndarray] = {}
+    why: dict[str, str] = {}
+    if getattr(profile, "kind", "") != "RIGIFY":
+        return weight, why
+    T = f1 - f0 + 1
+    for limb in profile.limbs():
+        sb = limb.switch_bone
+        pb = rig.pose.bones.get(sb) if sb else None
+        if pb is None or "IK_FK" not in pb.keys():
+            continue
+        fk = np.clip(action_io.read_bone_prop_curve(rig, sb, "IK_FK", f0, f1), 0.0, 1.0)
+        ik = 1.0 - fk
+        part = "arm" if limb.kind == "arm" else "leg"
+        ik_names = [limb.ik_ctrl, limb.ik_base_ctrl, limb.heel_ctrl]
+        if limb.toe_ctrl and "ik" in limb.toe_ctrl.lower():
+            ik_names.append(limb.toe_ctrl)
+        for n in ik_names:
+            if n:
+                weight[n], why[n] = ik, f"the {part} is in FK"
+        if limb.pole_ctrl:
+            pole_on = bool(pb["pole_vector"]) if "pole_vector" in pb.keys() else True
+            weight[limb.pole_ctrl] = ik if pole_on else np.zeros(T)
+            why[limb.pole_ctrl] = f"the {part} is in FK" if pole_on else f"the {part}'s pole target is switched off"
+        for n, _org in fk_chain(rig, limb):
+            weight[n], why[n] = fk, f"the {part} is in IK"
+    return weight, why
+
+
+def mark_idle(issues: list, rig, profile, f0: int, f1: int) -> int:
+    """Flag the issues on controls that do not move the character on their frames. Returns how many."""
+    weight, why = control_influence(rig, profile, f0, f1)
+    poles = {l.pole_ctrl for l in profile.limbs() if l.pole_ctrl} if getattr(profile, "kind", "") == "RIGIFY" else set()
+    n = 0
+    for it in issues:
+        if it.bone in poles and it.part == "rot":
+            # an IK pole is a point: its rotation does nothing
+            it.idle = True
+            it.message += " - not in use: only the position of a pole target counts, its rotation does nothing"
+            n += 1
+            continue
+        w = weight.get(it.bone)
+        if w is None:
+            continue
+        seg = w[max(it.frame_start - f0, 0): max(it.frame_end - f0 + 1, 1)]
+        if len(seg) and float(seg.mean()) < 0.05:
+            it.idle = True
+            it.message += f" - not in use here: {why[it.bone]}, so {it.bone} does not move the character"
+            n += 1
+    return n
+
+
 def inactive_controls(rig, profile, f0: int, f1: int) -> set[str]:
     """Controls of a chain that has no influence anywhere in the take: the IK controls of a limb that is in FK
     on every frame, the FK controls of one that is in IK on every frame. Their noise is not seen, and the
@@ -319,11 +386,12 @@ def analyze(rig, *, bone_names: list[str] | None = None, floor_z: float = 0.0, f
     issues: list[Issue] = []
     cutoff_cols = []
 
-    def add_runs(mask, kind, bone, sev, msg_fn, min_len=1, gap=0):
+    def add_runs(mask, kind, bone, sev, msg_fn, min_len=1, gap=0, part=""):
         mask = close_small_gaps(mask, gap) if gap else mask
         for s, e in find_runs(mask):
             if e - s + 1 >= min_len:
-                issues.append(Issue(kind, f0 + s, f0 + e, bone, float(np.clip(sev(s, e), 0.05, 1.0)), msg_fn(s, e)))
+                issues.append(Issue(kind, f0 + s, f0 + e, bone, float(np.clip(sev(s, e), 0.05, 1.0)), msg_fn(s, e),
+                                    part=part))
 
     # ---- pass 1: read everything, find dropouts (they own their frames) -----------------------------
     chans = {b: action_io.read_bone_local_channels(rig, b, f0, f1) for b in animated}
@@ -361,7 +429,8 @@ def analyze(rig, *, bone_names: list[str] | None = None, floor_z: float = 0.0, f
                 own = np.zeros(T, dtype=bool)
                 for s, e in runs:
                     own[s : e + 1] = True
-                    issues.append(Issue("FROZEN", f0 + s, f0 + e, bone, 0.6, f"{bone}: rotation frozen for {e - s + 1} frames"))
+                    issues.append(Issue("FROZEN", f0 + s, f0 + e, bone, 0.6, f"{bone}: rotation frozen for {e - s + 1} frames",
+                                        part="rot"))
                 protect = protect_all | _dilate(own, 4)
 
         # ---- flips ----------------------------------------------------------------------------
@@ -380,11 +449,12 @@ def analyze(rig, *, bone_names: list[str] | None = None, floor_z: float = 0.0, f
             flips &= step < np.radians(90.0)
             if flips.any():
                 report.flip_bones.append(bone)
-                add_runs(flips, "FLIP", bone, lambda s, e: 0.6, lambda s, e, w=what: f"{bone}: {w}")
+                add_runs(flips, "FLIP", bone, lambda s, e: 0.6, lambda s, e, w=what: f"{bone}: {w}", part="rot")
             jumps = (step > np.radians(100.0)) & ~protect
             if jumps.any():
                 add_runs(jumps, "FLIP", bone, lambda s, e: 1.0,
-                         lambda s, e: f"{bone}: rotation jumps {np.degrees(step[s:e + 1].max()):.0f} deg in one frame")
+                         lambda s, e: f"{bone}: rotation jumps {np.degrees(step[s:e + 1].max()):.0f} deg in one frame",
+                         part="rot")
 
         # ---- spikes / jitter ----------------------------------------------------------------------
         z_all = np.zeros(T)
@@ -417,14 +487,14 @@ def analyze(rig, *, bone_names: list[str] | None = None, floor_z: float = 0.0, f
                     msg = lambda s, e, a=amp: f"{bone}: rotation spike of {np.degrees(a[s:e + 1].max()):.1f} deg{doubt(s, e)}"
                 add_runs(spike, "SPIKE", bone,
                          lambda s, e, zz=z, ok=sure: (0.6 + 0.4 * min(1.0, zz[s:e + 1].max() / (4 * spike_z))) * (1.0 if ok[s:e + 1].all() else 0.6),
-                         msg)
+                         msg, part=key)
             burst = (z_sus >= jitter_z) & ~spike
             if burst.any():
                 label = "location" if key == "loc" else "rotation"
                 add_runs(burst, "JITTER", bone,
                          lambda s, e, zz=z_sus: 0.3 + 0.4 * min(1.0, zz[s:e + 1].max() / 6.0),
                          lambda s, e, zz=z_sus, lb=label: f"{bone}: {lb} noise {zz[s:e + 1].max():.1f}x above the clip level",
-                         min_len=5, gap=2)
+                         min_len=5, gap=2, part=key)
         conf = np.exp(-0.35 * np.maximum(z_all - 2.5, 0.0))
         conf[sure_any] = 0.02                  # the filter ignores these frames; a doubtful spike stays data
         report.confidence[bone] = conf
@@ -444,7 +514,9 @@ def analyze(rig, *, bone_names: list[str] | None = None, floor_z: float = 0.0, f
         issues += _world_checks(rig, profile, report, f0, f1, fps, floor_z, floor_object, hyperext, pop_threshold,
                                 skate_tol, penetration_tol, auto_floor, pins)
 
-    issues.sort(key=lambda i: (-i.severity * (1.0 + 0.02 * min(i.frame_end - i.frame_start, 50))))
+    mark_idle(issues, rig, profile, f0, f1)
+    # what is seen first: problems on controls that do nothing there come last (and go first if there are many)
+    issues.sort(key=lambda i: (i.idle, -i.severity * (1.0 + 0.02 * min(i.frame_end - i.frame_start, 50))))
     issues = issues[:max_issues]
     issues.sort(key=lambda i: (i.frame_start, -i.severity))
     report.issues = issues

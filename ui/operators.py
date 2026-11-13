@@ -148,7 +148,11 @@ class MOCAP_OT_issue_jump(Operator):
         rig = common.get_rig(context)
         data = rig.mocap_cleanup
         cur = context.scene.frame_current
-        starts = [(it.frame_start, i) for i, it in enumerate(data.issues)]
+        show_idle = context.scene.mocap_cleanup.show_idle_issues
+        starts = [(it.frame_start, i) for i, it in enumerate(data.issues) if show_idle or not it.idle]
+        if not starts:
+            self.report({"INFO"}, "Only problems on controls that are not in use are left (Show Unused Controls)")
+            return {"CANCELLED"}
         active = data.active_issue
         if self.direction > 0:
             later = [(f, i) for f, i in starts if f > cur or (f == cur and i > active)]
