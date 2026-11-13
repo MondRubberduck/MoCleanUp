@@ -39,10 +39,27 @@ def character_meshes(scene, rig):
     return out
 
 
+def moving_vertices(ob):
+    """Mask of the vertices weighted to a deforming bone of the mesh's armature (None: all, or unknown).
+
+    Loose vertices without a weight stay where they were modelled and say nothing about the feet
+    (the OptiTrack actor's mesh has six at z = -1 cm, which read as "1 cm under the floor" on every frame).
+    """
+    arms = [m.object for m in ob.modifiers
+            if m.type == "ARMATURE" and m.object is not None and m.object.type == "ARMATURE" and m.use_vertex_groups]
+    if not arms or not ob.vertex_groups or not len(ob.data.vertices):
+        return None
+    bones = {b.name for a in arms for b in a.data.bones if b.use_deform}
+    groups = {g.index for g in ob.vertex_groups if g.name in bones}
+    mask = np.array([any(g.group in groups and g.weight > 0.0 for g in v.groups) for v in ob.data.vertices], dtype=bool)
+    return None if (mask.all() or not mask.any()) else mask
+
+
 def mesh_lowest(scene, meshes, frames) -> np.ndarray:
-    """Lowest world z of the deformed meshes at each of ``frames``."""
+    """Lowest world z of the deformed meshes at each of ``frames`` (only vertices that follow a bone)."""
     out = np.full(len(frames), np.inf)
     cur = scene.frame_current
+    masks = {ob.name: moving_vertices(ob) for ob in meshes}
     for i, f in enumerate(frames):
         scene.frame_set(int(f))
         dg = bpy.context.evaluated_depsgraph_get()
@@ -52,7 +69,11 @@ def mesh_lowest(scene, meshes, frames) -> np.ndarray:
             co = np.empty(len(me.vertices) * 3)
             me.vertices.foreach_get("co", co)
             M = np.array(ev.matrix_world)
-            out[i] = min(out[i], float((co.reshape(-1, 3) @ M[2, :3] + M[2, 3]).min()))
+            z = co.reshape(-1, 3) @ M[2, :3] + M[2, 3]
+            mask = masks[ob.name]
+            if mask is not None and len(mask) == len(z):
+                z = z[mask]
+            out[i] = min(out[i], float(z.min()))
             ev.to_mesh_clear()
     scene.frame_set(cur)
     return out
@@ -207,7 +228,8 @@ def compare(before: dict, after: dict, floor_z: float, limits: dict | None = Non
             row(f"Knee {S} turned sideways", "", f"{turn[i]:.1f} deg at frame {f0 + i} (p95 {np.percentile(turn[bent], 95):.1f})",
                 f"{lim['knee_turn']} deg", bool(turn[i] <= lim["knee_turn"]))
     (kb, _wb), (ka, wa) = before["knee_accel"], after["knee_accel"]
-    row("Knee acceleration, max", f"{kb:.0f}", f"{ka:.0f} deg/s^2 (knee {wa})", f"{lim['knee_accel']} x raw",
+    row("Knee acceleration, max", f"{kb:.0f}", f"{ka:.0f} deg/s^2 (knee {wa})",
+        f"{lim['knee_accel']} x raw and +{lim['knee_accel_abs']} deg/s^2",
         not (ka > lim["knee_accel"] * kb and ka - kb > lim["knee_accel_abs"]))
     pb, pa = before["issues"].get("KNEE_POP", 0), after["issues"].get("KNEE_POP", 0)
     row("Joint pops flagged", str(pb), str(pa), "not more", pa <= pb)

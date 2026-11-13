@@ -33,10 +33,40 @@ def character_meshes(scene, rig) -> list:
     return out
 
 
+_moving_cache: dict = {}
+
+
+def moving_vertices(ob):
+    """Mask of the vertices that follow a bone: weighted to a deforming bone of the mesh's armature.
+
+    Vertices without such a weight stay where the mesh was modelled whatever the take does, so they
+    say nothing about where the feet are (an actor mesh with a few loose vertices at the origin sat
+    "1 cm under the floor" on every frame, QA N3). ``None`` when every vertex follows a bone, or when
+    it can't be told (no vertex groups, envelope deformation).
+    """
+    arms = [m.object for m in ob.modifiers
+            if m.type == "ARMATURE" and m.object is not None and m.object.type == "ARMATURE" and m.use_vertex_groups]
+    if not arms or not ob.vertex_groups or not len(ob.data.vertices):
+        return None
+    key = (ob.data.name, len(ob.data.vertices), tuple(a.name for a in arms))
+    if key in _moving_cache:
+        return _moving_cache[key]
+    bones = {b.name for a in arms for b in a.data.bones if b.use_deform}
+    groups = {g.index for g in ob.vertex_groups if g.name in bones}
+    mask = np.array([any(g.group in groups and g.weight > 0.0 for g in v.groups) for v in ob.data.vertices], dtype=bool)
+    mask = None if (mask.all() or not mask.any()) else mask
+    _moving_cache[key] = mask
+    return mask
+
+
 def mesh_lowest(scene, meshes, frames) -> np.ndarray:
-    """Lowest world z of the deformed meshes at each of ``frames`` (restores the current frame)."""
+    """Lowest world z of the deformed meshes at each of ``frames`` (restores the current frame).
+
+    Only vertices that follow a bone count (``moving_vertices``)."""
     out = np.full(len(frames), np.inf)
     cur = scene.frame_current
+    _moving_cache.clear()                      # weights may have changed since the last call
+    masks = {ob.name: moving_vertices(ob) for ob in meshes}
     try:
         for i, f in enumerate(frames):
             scene.frame_set(int(f))
@@ -49,7 +79,11 @@ def mesh_lowest(scene, meshes, frames) -> np.ndarray:
                         co = np.empty(len(me.vertices) * 3)
                         me.vertices.foreach_get("co", co)
                         M = np.array(ev.matrix_world)
-                        out[i] = min(out[i], float((co.reshape(-1, 3) @ M[2, :3] + M[2, 3]).min()))
+                        z = co.reshape(-1, 3) @ M[2, :3] + M[2, 3]
+                        mask = masks[ob.name]
+                        if mask is not None and len(mask) == len(z):
+                            z = z[mask]
+                        out[i] = min(out[i], float(z.min()))
                 finally:
                     ev.to_mesh_clear()
     finally:

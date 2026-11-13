@@ -13,7 +13,11 @@ if [ ${#TESTS[@]} -eq 0 ]; then
   TESTS=(test_core test_filters test_diagnostics test_contacts test_kinematics test_drift test_simplifier
          test_addon test_ui test_robustness)
   # static check, plain Python: every name that is used is defined
-  PY="$(command -v python3 || command -v python || true)"
+  # the first Python that actually runs (on Windows "python3" can be the Microsoft Store stub)
+  PY=""
+  for c in python3 python; do
+    if command -v "$c" >/dev/null 2>&1 && "$c" -c "" >/dev/null 2>&1; then PY="$c"; break; fi
+  done
   if [ -n "$PY" ]; then
     echo "=== check_names ==="
     "$PY" "$HERE/check_names.py" || exit 1

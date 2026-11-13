@@ -202,6 +202,8 @@ def test_run_all_simplify_restore_reload():
     # keys stage: residual layer blocks the other stages until it is merged
     keys_before = sum(len(fc.keyframe_points) for fc in action_io.iter_fcurves(rig))
     profile, dense = sample_rig(rig)
+    # without a layer, Merge / Show Detail are greyed out instead of failing when pressed (QA N3)
+    assert not bpy.ops.mocap.merge_residual.poll() and not bpy.ops.mocap.toggle_residual.poll()
     bpy.context.scene.mocap_cleanup.simplify_residual = True      # opt-in since the layer is off by default
     assert bpy.ops.mocap.simplify() == {"FINISHED"} and s6.has_residual(rig)
     keys_after = sum(len(fc.keyframe_points) for fc in action_io.iter_fcurves(rig))
@@ -213,8 +215,10 @@ def test_run_all_simplify_restore_reload():
         raise AssertionError("filter must refuse while a residual layer exists")
     except RuntimeError as exc:
         assert "residual" in str(exc).lower()
+    assert bpy.ops.mocap.merge_residual.poll() and bpy.ops.mocap.toggle_residual.poll()
     assert bpy.ops.mocap.toggle_residual() == {"FINISHED"} and not s6.residual_enabled(rig)
     assert bpy.ops.mocap.merge_residual() == {"FINISHED"} and not s6.has_residual(rig)
+    assert not bpy.ops.mocap.merge_residual.poll()
 
     # save, reload: pins, issues and snapshots survive, runtime caches do not
     path = os.path.join(tempfile.gettempdir(), "mc_test_addon_reload.blend")

@@ -762,7 +762,21 @@ class MOCAP_OT_simplify(_MocapOperator):
         return res.summary()
 
 
-class MOCAP_OT_merge_residual(_MocapOperator):
+class _ResidualOperator(_MocapOperator):
+    """Only available while the take has a residual detail layer (greyed out otherwise, QA N3)."""
+
+    @classmethod
+    def poll(cls, context):
+        rig = common.get_rig(context)
+        if rig is None:
+            return False
+        if not s6.has_residual(rig):
+            cls.poll_message_set("There is no residual detail layer")
+            return False
+        return True
+
+
+class MOCAP_OT_merge_residual(_ResidualOperator):
     bl_idname = "mocap.merge_residual"
     bl_label = "Merge Detail Layer"
     bl_description = "Bake sparse keys + residual detail back into dense curves (needed before running other stages again)"
@@ -777,7 +791,7 @@ class MOCAP_OT_merge_residual(_MocapOperator):
         return f"Merged the detail layer into {n} curves"
 
 
-class MOCAP_OT_toggle_residual(_MocapOperator):
+class MOCAP_OT_toggle_residual(_ResidualOperator):
     bl_idname = "mocap.toggle_residual"
     bl_label = "Toggle Detail"
     bl_description = "Show the animation with / without the residual mocap detail"
