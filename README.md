@@ -10,7 +10,7 @@ Blender 5.0 or newer (slotted actions). Tested on 5.2 and 5.3. NumPy only, no ex
 
 ## Install
 
-Download `mocap_cleanup-1.2.0.zip` from the [Releases page](https://github.com/MondRubberduck/MoCleanUp/releases/latest), then
+Download `mocap_cleanup-1.3.0.zip` from the [Releases page](https://github.com/MondRubberduck/MoCleanUp/releases/latest), then
 `Edit > Preferences > Get Extensions > ▾ > Install from Disk…` and pick it (or drag it into the Blender window).
 To build the zip yourself: `blender -c extension build --source-dir . --output-dir dist`.
 
