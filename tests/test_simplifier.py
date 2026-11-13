@@ -150,5 +150,48 @@ def test_plain_reduction_and_forced_keys():
     assert again.keys_after <= 1.3 * res.keys_after
 
 
+def test_joints_stay_within_bound():
+    """Without the residual layer, errors that are small on each curve add up along a chain. The rig's
+    joints have to stay within JOINT_FACTOR x Location of the dense take, and the report says how far (QA N2)."""
+    tol = 0.002
+    results = {}
+    for label, factor in (("per curve only", 1e9), ("joint check", s6.JOINT_FACTOR)):
+        rig, gt = scene()
+        dense = world(rig)
+        saved, s6.JOINT_FACTOR = s6.JOINT_FACTOR, factor
+        try:   # 2 degrees per rotation curve: along an arm that is centimetres, more than 2.5 x 2 mm
+            res = s6.simplify(rig, tol_loc=tol, tol_rot_deg=2.0, residual=False)
+        finally:
+            s6.JOINT_FACTOR = saved
+        pos, _rot = world_diff(dense, world(rig))
+        results[label] = (res, pos)
+        unit = inspect_rig(rig).unit
+        print(f"   {label:15s} {res.summary()} | measured {pos * 1000:.2f} mm")
+        bpy.data.objects.remove(rig)
+    tol_j = s6.JOINT_FACTOR * tol * unit
+    res_on, pos_on = results["joint check"]
+    res_off, pos_off = results["per curve only"]
+    assert pos_off > tol_j, ("the scene should need the check", pos_off, tol_j)
+    assert pos_on <= tol_j + 1e-5, (pos_on, tol_j)
+    assert abs(res_on.joint_tol - tol_j) < 1e-9 and res_on.joint_error <= tol_j + 1e-9
+    assert res_on.joint_error + 1e-5 >= pos_on            # it measures at least the joints watched here
+    assert res_off.keys_after < res_on.keys_after < 4 * res_off.keys_after, (res_off.keys_after, res_on.keys_after)
+    assert "joints within" in res_on.summary() and "aimed for" not in res_on.summary()
+
+
+def test_fit_keys_weight():
+    T = 240
+    t = np.arange(T)
+    Y = np.stack([np.sin(2 * np.pi * t / 60), 0.3 * np.cos(2 * np.pi * t / 23)], 1)
+    w = np.ones(T)
+    w[100:140] = 8.0
+    k0, _, e0 = s6.fit_keys(Y, 0.004)
+    k1, _, e1 = s6.fit_keys(Y, 0.004, weight=w)
+    assert e1[100:140].max() <= 0.004 / 8 + 1e-12 and e1.max() <= 0.004 + 1e-12, (e1[100:140].max(), e1.max())
+    assert len(k1) > len(k0)
+    assert np.sum((k1 < 95) | (k1 > 145)) <= np.sum((k0 < 95) | (k0 > 145)) + 4      # tighter only where weighted
+
+
 if __name__ == "__main__":
-    run_tests([test_fit_keys, test_residual_layer_is_exact, test_plain_reduction_and_forced_keys])
+    run_tests([test_fit_keys, test_fit_keys_weight, test_residual_layer_is_exact, test_plain_reduction_and_forced_keys,
+               test_joints_stay_within_bound])

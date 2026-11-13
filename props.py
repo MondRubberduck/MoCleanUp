@@ -317,7 +317,9 @@ class MCSettings(PropertyGroup):
     body_thickness: FloatProperty(name="Thickness", default=1.0, min=0.3, max=3.0, update=_solve_setting_update)
 
     # stage 6
-    simplify_tol_loc: FloatProperty(name="Location", default=0.002, min=0.0001, max=0.1, unit="LENGTH", precision=4)
+    simplify_tol_loc: FloatProperty(name="Location", default=0.002, min=0.0001, max=0.1, unit="LENGTH", precision=4,
+                                    description="How far a location curve may stray from the dense take (for a 1.75 m "
+                                                "character). The rig's joints are kept within 2.5 times this")
     simplify_tol_rot: FloatProperty(name="Rotation", default=0.5, min=0.01, max=10.0, description="Degrees")
     simplify_residual: BoolProperty(name="Residual Detail Layer", default=False,
                                     description="Keep what the sparse keys cannot express on an NLA layer. Off by "

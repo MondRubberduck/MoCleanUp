@@ -78,11 +78,12 @@ def _read(obj, entry, t: int) -> None:
         pose[t] = buf.reshape(-1, 4, 4)[idx].transpose(0, 2, 1)
 
 
-def _sample_isolated(entries, f0: int, T: int, scene) -> None:
+def _sample_isolated(entries, f0: int, T: int, scene, frames=None) -> None:
     """Evaluate the requested objects in a temporary scene that holds nothing else.
 
     Whatever they depend on (parents, constraint targets, driver sources) is still evaluated, the
-    rest of the scene (other characters, meshes, modifiers) is not.
+    rest of the scene (other characters, meshes, modifiers) is not. ``frames``: these scene frames
+    (``T`` of them) instead of ``f0 .. f0 + T - 1``.
     """
     tmp = bpy.data.scenes.new(ISOLATED_SCENE)
     try:
@@ -92,7 +93,7 @@ def _sample_isolated(entries, f0: int, T: int, scene) -> None:
             tmp.collection.objects.link(obj)
         layer = tmp.view_layers[0]
         for t in range(T):
-            tmp.frame_set(f0 + t)
+            tmp.frame_set(f0 + t if frames is None else int(frames[t]))
             deps = layer.depsgraph
             for entry in entries:
                 _read(entry[0].evaluated_get(deps), entry, t)
@@ -217,6 +218,24 @@ def sample_frames(obj, names: list[str], frames, scene=None) -> RigSample:
     world = np.stack([probes[f][0][0] for f in frames])
     pose = np.stack([probes[f][0][1] for f in frames])
     return RigSample(obj.name, 0, len(frames) - 1, names, pose, world)
+
+
+def sample_many_frames(obj, names: list[str], frames, scene=None) -> RigSample:
+    """``sample_frames`` for many frames: ``obj`` is evaluated on its own in a temporary scene when
+    ``sample_objects`` found that this matches the user's scene, else the scene is stepped."""
+    scene = scene or bpy.context.scene
+    frames = [int(f) for f in frames]
+    if frozenset({obj.name}) not in _trusted or not frames:
+        return sample_frames(obj, names, frames, scene)
+    all_names = [pb.name for pb in obj.pose.bones]
+    lookup = {n: i for i, n in enumerate(all_names)}
+    names = [n for n in dict.fromkeys(names) if n in lookup]
+    idx = np.array([lookup[n] for n in names], dtype=np.int64)
+    T = len(frames)
+    entry = (obj, names, idx, np.empty(len(all_names) * 16, dtype=np.float32),
+             np.empty((T, len(names), 4, 4), dtype=np.float64), np.empty((T, 4, 4), dtype=np.float64))
+    _sample_isolated([entry], 0, T, scene, frames=frames)
+    return RigSample(obj.name, 0, T - 1, names, entry[4], entry[5])
 
 
 # ---------------------------------------------------------------------------
