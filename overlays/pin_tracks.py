@@ -27,6 +27,23 @@ MODE_COLORS = {
 }
 
 
+def view_mapping(region) -> tuple[float, float, float, float]:
+    """Exact view -> region mapping of a 2D editor: ``(x0, sx, y0, sy)``, region x = ``x0 + sx * frame``.
+
+    ``View2D.view_to_region`` returns whole pixels, so a scale taken from two neighbouring frames came
+    out as 0, 1 or 2 px depending on zoom and pan: tracks and marks slid along the time line, collapsed
+    onto frame 0 or vanished (GUI feedback). ``region_to_view`` is exact; it is taken across the whole
+    region.
+    """
+    v2d = region.view2d
+    w, h = max(int(region.width), 1), max(int(region.height), 1)
+    left, bottom = v2d.region_to_view(0, 0)
+    right, top = v2d.region_to_view(w, h)
+    sx = w / (right - left) if right != left else 1.0
+    sy = h / (top - bottom) if top != bottom else 1.0
+    return -left * sx, sx, -bottom * sy, sy
+
+
 def ui_scale(context) -> float:
     s = float(context.preferences.system.ui_scale)
     return s if s > 0.01 else 1.0          # (0 in background mode)
@@ -55,10 +72,7 @@ def layout(context, region, rig) -> dict:
     has_markers = scene is not None and len(scene.timeline_markers) > 0
     base = (44.0 if has_markers else 16.0) * s                 # scrollbar (+ marker line)
     top = base + len(owners) * (row_h + gap) - gap
-    v2d = region.view2d
-    x0 = v2d.view_to_region(0.0, 0.0, clip=False)[0]
-    x1 = v2d.view_to_region(1.0, 0.0, clip=False)[0]
-    per_frame = x1 - x0
+    x0, per_frame, _y0, _sy = view_mapping(region)
 
     def fx(frame: float) -> float:
         return x0 + per_frame * frame

@@ -93,11 +93,16 @@ def _header(layout, st, rig):
     row = layout.row(align=True)
     row.prop(st, "preset", text="")
     row.operator("mocap.apply_preset", text="", icon="CHECKMARK")
-    row = layout.row(align=True)
-    row.scale_y = 1.3
-    row.operator("mocap.run_all", icon="PLAY")
     row.operator("mocap.workspace_setup", text="", icon="WORKSPACE")
     return True
+
+
+def _run_all_footer(layout) -> None:
+    """The one-click button comes after the steps it runs, not before Analyze (GUI feedback)."""
+    box = layout.box()
+    row = box.row(align=True)
+    row.scale_y = 1.3
+    row.operator("mocap.run_all", text="Clean Up Take (all steps)", icon="PLAY")
 
 
 def _floor_rows(col, st) -> None:
@@ -423,11 +428,12 @@ class _MainPanel:
         body = layout.column()
         if needs_rigify and not common.profile_of(rig).is_supported and st.stage != "DRIFT":
             body.label(text="This stage needs Rigify IK controls", icon="ERROR")
-            return
-        STAGE_DRAW[st.stage](body, context, st, rig)
+        else:
+            STAGE_DRAW[st.stage](body, context, st, rig)
         text = common.result_for(rig)
         if text:
             _wrapped(layout.box(), context, text)
+        _run_all_footer(layout)
 
 
 class _OverlayPanel:

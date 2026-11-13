@@ -105,9 +105,7 @@ def _draw_marks(context, region, rig, st) -> None:
     data = rig.mocap_cleanup
     if not len(data.issues):
         return
-    v2d = region.view2d
-    x0 = v2d.view_to_region(0.0, 0.0, clip=False)[0]
-    per_frame = v2d.view_to_region(1.0, 0.0, clip=False)[0] - x0
+    x0, per_frame, _y0, _sy = pin_tracks.view_mapping(region)
     selected = set(action_io.selected_pose_bone_names(rig)) if st.marks_only_selected else None
     s = pin_tracks.ui_scale(context)
     h = region.height
@@ -157,9 +155,7 @@ def _draw_ghosts(context, region, rig, curves=None) -> None:
     if not curves:
         return
     v2d = region.view2d
-    ox, oy = v2d.view_to_region(0.0, 0.0, clip=False)
-    px, py = v2d.view_to_region(1.0, 1.0, clip=False)
-    sx, sy = px - ox, py - oy
+    ox, sx, oy, sy = pin_tracks.view_mapping(region)
     left = v2d.region_to_view(0, 0)[0]
     right = v2d.region_to_view(region.width, 0)[0]
     degrees = context.scene.unit_settings.system_rotation == "DEGREES"

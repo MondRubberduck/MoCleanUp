@@ -287,5 +287,36 @@ def test_overlays_render():
     print(f"   offscreen: marks, {seen} pin bars, ghost curve ({lit} px), HUD ({lit_hud} px)")
 
 
+def test_view_mapping_is_exact():
+    """Tracks and marks sit on their frames at any zoom and pan (GUI feedback: they slid, collapsed onto
+    frame 0 or vanished, because the scale came from two neighbouring frames in whole pixels)."""
+
+    class V2D:
+        def __init__(self, left, right, bottom, top, w, h):
+            self.l, self.r, self.b, self.t, self.w, self.h = left, right, bottom, top, w, h
+
+        def region_to_view(self, x, y):
+            return (self.l + x * (self.r - self.l) / self.w, self.b + y * (self.t - self.b) / self.h)
+
+        def view_to_region(self, x, y, clip=True):            # Blender returns whole pixels
+            return (int((x - self.l) * self.w / (self.r - self.l)), int((y - self.b) * self.h / (self.t - self.b)))
+
+    class Region:
+        def __init__(self, v2d):
+            self.view2d, self.width, self.height = v2d, v2d.w, v2d.h
+
+    for left, right in ((-596.3, 3245.1), (952.7, 2534.2), (1400.25, 1700.5)):   # zoomed out, mid, zoomed in
+        region = Region(V2D(left, right, -1.3, 2.7, 1012, 300))
+        x0, sx, y0, sy = pin_tracks.view_mapping(region)
+        for f in (0.0, 1473.0, 1492.5, 3000.0):
+            exact = (f - left) * region.width / (right - left)
+            assert abs(x0 + sx * f - exact) < 1e-6, (left, right, f, x0 + sx * f, exact)
+        assert abs(y0 + sy * 0.5 - (0.5 + 1.3) * 300 / 4.0) < 1e-6
+    # what it replaced: two neighbouring frames in whole pixels give 0 px per frame when zoomed out
+    region = Region(V2D(-596.3, 3245.1, -1.3, 2.7, 1012, 300))
+    old = region.view2d.view_to_region(1.0, 0.0)[0] - region.view2d.view_to_region(0.0, 0.0)[0]
+    assert old in (0, 1)
+
+
 if __name__ == "__main__":
-    run_tests([test_every_panel_layout, test_workspace_layout, test_overlays_render])
+    run_tests([test_every_panel_layout, test_workspace_layout, test_overlays_render, test_view_mapping_is_exact])

@@ -32,12 +32,12 @@ MODE_ITEMS = (
     ("TARGET", "Target", "Follow another object or a bone of another character", "CON_CHILDOF", 2),
 )
 STAGE_ITEMS = (
-    ("DIAGNOSE", "Diagnose", "1. Find flips, spikes, dropouts, jitter, sliding feet and popping knees", "VIEWZOOM", 0),
-    ("FILTER", "Filter", "2. Remove jitter without touching clean motion", "SMOOTHCURVE", 1),
-    ("DRIFT", "Drift", "3. Global trajectory: drift, floor level, loops", "TRACKING", 2),
-    ("CONTACTS", "Pins", "4. Plant feet, pin hands to the world or to another character, keep everything above the floor", "PINNED", 3),
-    ("PHYSICS", "Body", "5. Knee and elbow pops, soft IK, jump arcs, hands inside the body", "ARMATURE_DATA", 4),
-    ("SIMPLIFY", "Keys", "6. Reduce the take to editable keys, keep the detail on a layer", "KEYFRAME", 5),
+    ("DIAGNOSE", "1 Analyze", "1. Find flips, spikes, dropouts, jitter, sliding feet and popping knees", "VIEWZOOM", 0),
+    ("FILTER", "2 Filter", "2. Remove jitter without touching clean motion", "SMOOTHCURVE", 1),
+    ("DRIFT", "3 Drift", "3. Global trajectory: drift, floor level, loops", "TRACKING", 2),
+    ("CONTACTS", "4 Pins", "4. Plant feet, pin hands to the world or to another character, keep everything above the floor", "PINNED", 3),
+    ("PHYSICS", "5 Body", "5. Knee and elbow pops, soft IK, jump arcs, hands inside the body", "ARMATURE_DATA", 4),
+    ("SIMPLIFY", "6 Keys", "6. Reduce the take to editable keys, keep the detail on a layer", "KEYFRAME", 5),
 )
 FILTER_ITEMS = (
     ("WHITTAKER", "Whittaker", "Penalized least squares (Eilers 2003): no edge artifacts, supports confidence weights"),

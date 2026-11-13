@@ -582,6 +582,14 @@ class MOCAP_OT_pin_add(_MocapOperator):
         if self.owner != "AUTO":
             owners = [self.owner]
         else:
+            # The limb of the control you clicked last - not every control that happens to be selected:
+            # with the whole rig selected, one click pinned hips, both feet and both hands (GUI feedback).
+            active = getattr(context, "active_pose_bone", None)
+            if active is not None and active.id_data == rig:
+                o = common.owner_of_bone(profile, active.name)
+                if o:
+                    owners = [o]
+        if not owners and self.owner == "AUTO":
             for name in action_io.selected_pose_bone_names(rig):
                 o = common.owner_of_bone(profile, name)
                 if o and o not in owners:
