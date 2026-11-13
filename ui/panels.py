@@ -77,7 +77,7 @@ def _header(layout, st, rig):
     row.prop(st, "rig", text="")
     row.operator("mocap.use_active_rig", text="", icon="EYEDROPPER")
     if rig is None:
-        col.label(text="Pick an animated control rig", icon="INFO")
+        col.label(text="Pick an animated rig or skeleton", icon="INFO")
         return False
     act = action_io.get_active_action(rig)
     if act is None:
@@ -89,8 +89,12 @@ def _header(layout, st, rig):
     info.label(text=f"{act.name}  [{f0}-{f1}]", icon="ACTION")
     if not profile.is_supported:
         box = layout.box()
-        box.label(text="No Rigify controls found:", icon="ERROR")
+        box.label(text="No control rig or humanoid skeleton found:", icon="ERROR")
         box.label(text="curve tools only (diagnose, filter, keys)")
+    elif profile.kind == "SKELETON":
+        sub = col.row()
+        sub.scale_y = 0.8
+        sub.label(text="Skeleton: no control rig needed", icon="ARMATURE_DATA")
     row = layout.row(align=True)
     row.prop(st, "preset", text="")
     row.operator("mocap.apply_preset", text="", icon="CHECKMARK")
@@ -482,7 +486,7 @@ class _MainPanel:
             box = layout.box()
             _wrapped(box, context, items[ident].description)
             if ident in {"CONTACTS", "PHYSICS"} and not common.profile_of(rig).is_supported:
-                box.label(text="This step needs Rigify IK controls", icon="ERROR")
+                box.label(text="This step needs a control rig or a humanoid skeleton", icon="ERROR")
             else:
                 STAGE_DRAW[ident](box, context, st, rig)
         text = common.result_for(rig)

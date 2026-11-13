@@ -174,6 +174,65 @@ def synth_walk(rig, n_frames: int = 120, cycle: int = 30, stride: float = 0.8, d
     return {"f0": f0, "f1": f0 + T - 1, "T": T, "plants": plants, "torso": torso, "feet": feet, "speed": v}
 
 
+SKELETON_MAP = {  # Rigify ORG joint -> (plain skeleton bone, parent), Mixamo-style names
+    "ORG-spine": ("Hips", None), "ORG-spine.001": ("Spine", "Hips"), "ORG-spine.002": ("Spine1", "Spine"),
+    "ORG-spine.003": ("Spine2", "Spine1"), "ORG-spine.004": ("Neck", "Spine2"), "ORG-spine.006": ("Head", "Neck"),
+}
+for _S, _side in (("L", "Left"), ("R", "Right")):
+    SKELETON_MAP.update({
+        f"ORG-thigh.{_S}": (f"{_side}UpLeg", "Hips"), f"ORG-shin.{_S}": (f"{_side}Leg", f"{_side}UpLeg"),
+        f"ORG-foot.{_S}": (f"{_side}Foot", f"{_side}Leg"), f"ORG-toe.{_S}": (f"{_side}ToeBase", f"{_side}Foot"),
+        f"ORG-shoulder.{_S}": (f"{_side}Shoulder", "Spine2"), f"ORG-upper_arm.{_S}": (f"{_side}Arm", f"{_side}Shoulder"),
+        f"ORG-forearm.{_S}": (f"{_side}ForeArm", f"{_side}Arm"), f"ORG-hand.{_S}": (f"{_side}Hand", f"{_side}ForeArm"),
+    })
+
+
+def make_skeleton(rig, name: str = "skeleton", fbx_like: bool = True):
+    """A plain FK skeleton (no controls, Mixamo-style names) that plays the animated Rigify rig's motion.
+
+    ``fbx_like``: like an FBX import - the object turned 90 degrees about X and scaled to 0.01 (bones Y-up in
+    armature space) and location keys on every bone, the way Motive exports them."""
+    from mathutils import Matrix
+
+    f0, f1 = action_io.get_action_frame_range(rig)
+    src = sampler.sample_objects([(rig, list(SKELETON_MAP))], f0, f1)[rig.name]
+    OBJ = (Matrix.Rotation(np.pi / 2, 4, "X") @ Matrix.Scale(0.01, 4)) if fbx_like else Matrix.Identity(4)
+    OBJ_np = np.array(OBJ, dtype=np.float64)
+    inv_obj = np.linalg.inv(OBJ_np)
+
+    def arm_space(W):                                   # world -> skeleton armature space, unit axes
+        M = inv_obj @ W
+        M[..., :3, :3] /= np.linalg.norm(M[..., :3, :3], axis=-2, keepdims=True)
+        return M
+
+    data = bpy.data.armatures.new(name)
+    ob = bpy.data.objects.new(name, data)
+    bpy.context.scene.collection.objects.link(ob)
+    ob.matrix_world = OBJ
+    bpy.context.view_layer.objects.active = ob
+    bpy.ops.object.mode_set(mode="EDIT")
+    rest_w = np.array(rig.matrix_world, dtype=np.float64)
+    for org, (bn, parent) in SKELETON_MAP.items():
+        b = rig.data.bones[org]
+        M = arm_space(rest_w @ np.array(b.matrix_local, dtype=np.float64))
+        eb = data.edit_bones.new(bn)
+        eb.head = M[:3, 3]
+        eb.tail = M[:3, 3] + M[:3, 1] * b.length * 100.0 if fbx_like else M[:3, 3] + M[:3, 1] * b.length
+        eb.align_roll(M[:3, 2])
+    for org, (bn, parent) in SKELETON_MAP.items():
+        if parent:
+            data.edit_bones[bn].parent = data.edit_bones[parent]
+    bpy.ops.object.mode_set(mode="OBJECT")
+    for pb in ob.pose.bones:
+        pb.rotation_mode = "QUATERNION"
+    poses = {bn: arm_space(src.world_m(org)) for org, (bn, _p) in SKELETON_MAP.items()}
+    for org, (bn, parent) in SKELETON_MAP.items():
+        loc, quat = sampler.pose_to_basis(ob, bn, poses[bn], poses[parent] if parent else None)
+        action_io.write_bone_local_channels(ob, bn, f0, loc=loc if (fbx_like or parent is None) else None, quat=quat)
+    bpy.context.view_layer.update()
+    return ob
+
+
 def sample_rig(rig, extra: list[str] | None = None):
     profile = inspect_rig(rig)
     names = solver_bone_names(profile, rig.data.bones) + list(extra or [])

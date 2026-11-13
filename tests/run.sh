@@ -11,7 +11,7 @@ HERE="$(cd "$(dirname "$0")" && pwd -W 2>/dev/null || pwd)"
 TESTS=("$@")
 if [ ${#TESTS[@]} -eq 0 ]; then
   TESTS=(test_core test_filters test_diagnostics test_contacts test_kinematics test_drift test_simplifier
-         test_addon test_ui test_robustness)
+         test_addon test_ui test_robustness test_skeleton)
   # static check, plain Python: every name that is used is defined
   # the first Python that actually runs (on Windows "python3" can be the Microsoft Store stub)
   PY=""

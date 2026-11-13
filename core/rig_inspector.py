@@ -1,8 +1,13 @@
-"""Rigify / Rig-Bridge control rig inspection.
+"""Rig inspection: a Rigify / Rig-Bridge control rig, or a plain humanoid skeleton.
 
 Builds a :class:`RigProfile` that names the controls and mechanism bones the cleanup stages need
 (IK controls, pole targets, FK/IK switch bones, ``ORG-`` joints, sole geometry, mass segments).
-Nothing is generated or modified here; the add-on works on an existing animated control rig.
+
+A plain skeleton (a Mixamo, Motive / OptiTrack, Unreal or Character Creator take as it is imported, before any
+control rig exists) has no controls: its limb joints stand in for them (``kind == "SKELETON"``), and the solver
+writes the result back as rotations of those joints (see ``stages.solver``). Rest-pose geometry is measured
+upright, in the object's orientation: FBX imports are usually turned 90 degrees and scaled to 0.01.
+Nothing is generated or modified here.
 """
 
 from __future__ import annotations
@@ -72,6 +77,10 @@ class LimbSpec:
         return self.upper_len + self.lower_len
 
     @property
+    def is_skeleton(self) -> bool:
+        return self.ik_ctrl == self.org_end
+
+    @property
     def label(self) -> str:
         return ("Foot" if self.kind == "leg" else "Hand") + "." + self.side
 
@@ -84,6 +93,7 @@ class LimbSpec:
 class RigProfile:
     rig_name: str
     is_supported: bool
+    kind: str = ""                # 'RIGIFY' | 'SKELETON' | '' (nothing the IK-based tools can work on)
     root_ctrl: str = ""
     torso_ctrl: str = ""
     head_bone: str = ""
@@ -135,6 +145,13 @@ def _spine_chain(bones) -> list[str]:
     return [n for _, n in sorted(found)]
 
 
+def _upright(rig) -> np.ndarray:
+    """Rotation ``(3, 3)`` from armature space to an upright frame (the object's rotation without its scale)."""
+    m = np.array(rig.matrix_world.to_3x3(), dtype=np.float64)
+    n = np.linalg.norm(m, axis=0)
+    return m / np.where(n < 1e-12, 1.0, n)
+
+
 def inspect_rig(rig) -> RigProfile:
     """Inspect an armature object. ``profile.is_supported`` tells whether IK-based tools can run."""
     if rig is None or rig.type != "ARMATURE":
@@ -142,9 +159,14 @@ def inspect_rig(rig) -> RigProfile:
     bones = rig.data.bones
     scale = float(np.mean([abs(s) for s in rig.matrix_world.to_scale()]))
     profile = RigProfile(rig_name=rig.name, is_supported=False, scale=scale)
+    A = _upright(rig)
 
     profile.root_ctrl = _first(bones, "root")
     profile.torso_ctrl = _first(bones, "torso")
+    if not (profile.torso_ctrl and "foot_ik.L" in bones and "foot_ik.R" in bones):
+        skel = _inspect_skeleton(rig, profile)
+        if skel is not None:
+            return skel
 
     # ---- rest floor level (armature space) -------------------------------------------------
     floor_candidates = []
@@ -154,28 +176,29 @@ def inspect_rig(rig) -> RigProfile:
             continue
         for child in foot.children:
             if child.name.startswith("ORG-") and "heel" in child.name.lower() and not child.children:
-                floor_candidates += [child.head_local.z, child.tail_local.z]
+                floor_candidates += [_uz(A, child.head_local), _uz(A, child.tail_local)]
     if floor_candidates:
         rest_floor = float(min(floor_candidates))
     else:
-        zs = [b.head_local.z for b in bones if b.name.startswith(("ORG-", "DEF-"))] or [b.head_local.z for b in bones]
-        zs += [b.tail_local.z for b in bones if b.name.startswith(("ORG-toe", "DEF-toe"))]
+        zs = [_uz(A, b.head_local) for b in bones if b.name.startswith(("ORG-", "DEF-"))] or \
+            [_uz(A, b.head_local) for b in bones]
+        zs += [_uz(A, b.tail_local) for b in bones if b.name.startswith(("ORG-toe", "DEF-toe"))]
         rest_floor = float(min(zs)) if zs else 0.0
     profile.rest_floor_z = rest_floor
 
-    top = [max(b.head_local.z, b.tail_local.z) for b in bones if b.name.startswith(("ORG-", "DEF-"))]
+    top = [max(_uz(A, b.head_local), _uz(A, b.tail_local)) for b in bones if b.name.startswith(("ORG-", "DEF-"))]
     if not top:
-        top = [max(b.head_local.z, b.tail_local.z) for b in bones]
+        top = [max(_uz(A, b.head_local), _uz(A, b.tail_local)) for b in bones]
     height_arm = max((max(top) - rest_floor) if top else 1.75, 1e-3)
     profile.character_height = height_arm * scale
     profile.unit = profile.character_height / 1.75
 
     # ---- limbs -------------------------------------------------------------------------------
     for S in ("L", "R"):
-        leg = _build_limb(bones, "leg", S, scale, rest_floor)
+        leg = _build_limb(bones, "leg", S, scale, rest_floor, A)
         if leg is not None:
             profile.legs[S] = leg
-        arm = _build_limb(bones, "arm", S, scale, rest_floor)
+        arm = _build_limb(bones, "arm", S, scale, rest_floor, A)
         if arm is not None:
             profile.arms[S] = arm
     for limb in profile.limbs():
@@ -189,11 +212,11 @@ def inspect_rig(rig) -> RigProfile:
     if chain:
         neck_z = None
         if neck_ctrl is not None:
-            neck_z = neck_ctrl.head_local.z
+            neck_z = _uz(A, neck_ctrl.head_local)
         elif head_ctrl is not None:
-            neck_z = head_ctrl.head_local.z
+            neck_z = _uz(A, head_ctrl.head_local)
         if neck_z is not None:
-            torso_part = [n for n in chain if bones[n].head_local.z < neck_z - 1e-4]
+            torso_part = [n for n in chain if _uz(A, bones[n].head_local) < neck_z - 1e-4]
             rest = [n for n in chain if n not in torso_part]
         else:
             torso_part, rest = (chain[:-1], chain[-1:]) if len(chain) > 1 else (chain, [])
@@ -206,7 +229,18 @@ def inspect_rig(rig) -> RigProfile:
     if not profile.head_bone:
         profile.head_bone = _first(bones, "ORG-head", "DEF-head", "head")
 
-    # ---- centre of mass segments -------------------------------------------------------------------
+    _com_segments(profile, bones)
+
+    profile.is_supported = bool(profile.torso_ctrl and len(profile.legs) == 2)
+    if profile.is_supported:
+        profile.kind = "RIGIFY"
+    else:
+        profile.message = ("No Rigify control rig and no humanoid skeleton found (a skeleton needs two legs: "
+                           "thigh, shin and foot bones hanging from the hips).")
+    return profile
+
+
+def _com_segments(profile: RigProfile, bones) -> None:
     segs: list[tuple[str, float, float]] = []
     if profile.spine_bones:
         lengths = np.array([bones[n].length for n in profile.spine_bones], dtype=np.float64)
@@ -228,13 +262,220 @@ def inspect_rig(rig) -> RigProfile:
     total = sum(m for _, m, _ in segs)
     profile.com_segments = [(b, m / total, c) for b, m, c in segs] if total > 0 else []
 
-    profile.is_supported = bool(profile.torso_ctrl and len(profile.legs) == 2)
-    if not profile.is_supported:
-        profile.message = "No Rigify-style control rig found (needs 'torso' and 'foot_ik.L/R' controls)."
+
+# ---------------------------------------------------------------------------
+# Plain skeletons
+# ---------------------------------------------------------------------------
+
+_FINGER = {"thumb", "index", "middle", "ring", "pinky", "little", "finger", "fingers", "metacarpal", "palm", "carpal"}
+_HELPER = {"ik", "fk", "twist", "share", "sharebone", "roll", "end", "nub", "root", "pole", "target", "ctrl", "ctl",
+           "mch", "org", "def", "tweak", "gun", "prop", "attach", "weapon", "helper", "corrective", "parent", "socket",
+           "ref", "offset", "null", "dummy", "bend", "vis", "widget", "bind"}
+
+
+def name_tokens(name: str) -> list[str]:
+    """Lower-case words of a bone name without its namespace: ``mixamorig:LeftUpLeg`` -> left, up, leg;
+    ``LThigh`` -> l, thigh; ``CC_Base_L_Thigh`` -> cc, base, l, thigh."""
+    base = name.split(":")[-1].split("|")[-1]
+    out: list[str] = []
+    for part in re.split(r"[^A-Za-z0-9]+", base):
+        out += [t.lower() for t in re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+", part)]
+    return out
+
+
+def name_side(name: str) -> str:
+    toks = name_tokens(name)
+    if "left" in toks or "l" in toks or any(t.startswith("left") for t in toks):
+        return "L"
+    if "right" in toks or "r" in toks or any(t.startswith("right") for t in toks):
+        return "R"
+    return ""
+
+
+def _is_helper(toks) -> bool:
+    # also inside joined lower-case words: CC's "toebasesharebone", "forearmtwist01"
+    return any(t in _HELPER or "twist" in t or "share" in t for t in toks)
+
+
+def _is_foot(bone) -> bool:
+    toks = name_tokens(bone.name)
+    return (("foot" in toks or "ankle" in toks or any(t.endswith("foot") for t in toks)) and not _is_helper(toks)
+            and not ({"toe", "toes", "ball", "heel"} & set(toks)))
+
+
+def _is_hand(bone) -> bool:
+    toks = name_tokens(bone.name)
+    return (("hand" in toks or "wrist" in toks or any(t.endswith("hand") for t in toks)) and not _is_helper(toks)
+            and not (_FINGER & set(toks)))
+
+
+def _chain(end, min_len: float):
+    """``(upper, lower)`` of the two-bone chain that ends in ``end``, or None.
+
+    The joints must follow each other directly (a twist bone in between is a side branch, not part of the
+    chain), and the two segments must look like a thigh and a shin (or an upper arm and a forearm)."""
+    lower = end.parent
+    upper = lower.parent if lower is not None else None
+    if upper is None or _is_helper(name_tokens(lower.name)) or _is_helper(name_tokens(upper.name)):
+        return None
+    a = float(np.linalg.norm(np.array(lower.head_local) - np.array(upper.head_local)))
+    b = float(np.linalg.norm(np.array(end.head_local) - np.array(lower.head_local)))
+    if a < min_len or b < min_len or not 0.4 < a / b < 2.5:
+        return None
+    return upper, lower
+
+
+def _ancestors(bone) -> list:
+    out = []
+    while bone is not None:
+        out.append(bone)
+        bone = bone.parent
+    return out
+
+
+def _common_ancestor(a, b):
+    up = {x.name for x in _ancestors(b)}
+    for x in _ancestors(a):
+        if x.name in up:
+            return x
+    return None
+
+
+def _pick_sides(cands: list, A: np.ndarray, forward: np.ndarray) -> dict:
+    """``{'L': (end, upper, lower), 'R': ...}`` from chain candidates, by name or else by position."""
+    out: dict = {}
+    for c in cands:
+        s = name_side(c[0].name)
+        if s and s not in out:
+            out[s] = c
+    if len(out) < 2 and len(cands) >= 2:
+        # No side in the names: the character's left is up x forward (facing -Y, left is +X).
+        left = np.cross(np.array([0.0, 0.0, 1.0]), forward)
+        pts = [A @ np.array(c[0].head_local) for c in cands[:2]]
+        mid = 0.5 * (pts[0] + pts[1])
+        first_left = float(np.dot(pts[0] - mid, left)) > 0.0
+        out = {"L": cands[0] if first_left else cands[1], "R": cands[1] if first_left else cands[0]}
+    return out
+
+
+def _toe_of(foot):
+    kids = [c for c in foot.children if not _is_helper(name_tokens(c.name))]
+    for c in kids:
+        if {"toe", "toes", "ball", "toebase"} & set(name_tokens(c.name)):
+            return c
+    for c in kids:
+        if "toe" in c.name.lower():
+            return c
+    return max(kids, key=lambda c: c.length) if kids else None
+
+
+def _inspect_skeleton(rig, base: RigProfile) -> RigProfile | None:
+    """Profile of a plain humanoid skeleton, None when the armature is not one."""
+    bones = rig.data.bones
+    A = _upright(rig)
+    scale = base.scale
+    zs = [_uz(A, b.head_local) for b in bones]
+    if not zs:
+        return None
+    span = max(zs) - min(zs)
+    min_len = 0.05 * max(span, 1e-6)
+
+    legs = [(b, *ch) for b in bones if _is_foot(b) for ch in [_chain(b, min_len)] if ch is not None]
+    if len(legs) < 2:
+        return None
+    fwd = np.zeros(3)
+    for end, _u, _l in legs:
+        toe = _toe_of(end)
+        tip = np.array(toe.head_local) if toe is not None else np.array(end.tail_local)
+        fwd += A @ (tip - np.array(end.head_local))
+    fwd[2] = 0.0
+    fwd = fwd / np.linalg.norm(fwd) if np.linalg.norm(fwd) > 1e-9 else np.array([0.0, -1.0, 0.0])
+    leg_sides = _pick_sides(legs, A, fwd)
+    if set(leg_sides) != {"L", "R"}:
+        return None
+    hips = _common_ancestor(leg_sides["L"][1], leg_sides["R"][1])
+    if hips is None or hips.name in (leg_sides["L"][1].name, leg_sides["R"][1].name):
+        return None
+
+    arms = [(b, *ch) for b in bones if _is_hand(b) for ch in [_chain(b, min_len)] if ch is not None
+            and hips.name in {x.name for x in _ancestors(ch[0])}]
+    arm_sides = _pick_sides(arms, A, fwd) if len(arms) >= 2 else {}
+
+    profile = RigProfile(rig_name=rig.name, is_supported=True, kind="SKELETON", scale=scale)
+    profile.torso_ctrl = hips.name
+    profile.root_ctrl = _ancestors(hips)[-1].name
+    # spine: hips up to the bone both arms hang from (the chest)
+    chest = None
+    if set(arm_sides) == {"L", "R"}:
+        chest = _common_ancestor(arm_sides["L"][1], arm_sides["R"][1])
+    path = []
+    if chest is not None and hips.name in {x.name for x in _ancestors(chest)}:
+        for x in _ancestors(chest):
+            path.append(x.name)
+            if x.name == hips.name:
+                break
+        path.reverse()
+    profile.spine_bones = path or [hips.name]
+    top = bones[profile.spine_bones[-1]]
+    heads = [d for d in top.children_recursive if "head" in name_tokens(d.name) and not _is_helper(name_tokens(d.name))]
+    if heads:
+        head = min(heads, key=lambda d: len(_ancestors(d)))
+        profile.head_bone = head.name
+        below = {y.name for y in _ancestors(top)}
+        profile.neck_bones = [x.name for x in reversed(_ancestors(head.parent)) if x.name not in below]
+
+    # rest floor and height, upright
+    floor_pts = []
+    for end, _u, _l in leg_sides.values():
+        floor_pts += [end.head_local, end.tail_local]
+        toe = _toe_of(end)
+        if toe is not None:
+            floor_pts += [toe.head_local, toe.tail_local] + [d.head_local for d in toe.children_recursive]
+    rest_floor = min(_uz(A, p) for p in floor_pts)
+    top_pts = [b.head_local for b in bones]
+    # Without a heel or toe-tip bone the lowest joint is the ball of the foot, a couple of centimetres above
+    # the sole. The ankle joint sits at about 4.6 % of the body height above it (Winter, table 4.1).
+    ankle_z = float(np.mean([_uz(A, end.head_local) for end, _u, _l in leg_sides.values()]))
+    est_top = max(_uz(A, p) for p in top_pts)
+    rest_floor = min(rest_floor, ankle_z - 0.046 * max(est_top - rest_floor, 1e-6))
+    if profile.head_bone:
+        top_pts.append(bones[profile.head_bone].tail_local)
+    top_z = max(_uz(A, p) for p in top_pts)
+    if profile.head_bone and bones[profile.head_bone].length < 0.03 * span:
+        top_z += 0.075 * (top_z - rest_floor)          # a head joint without a head bone: the skull is ~7% of the height
+    profile.rest_floor_z = rest_floor
+    profile.character_height = max(top_z - rest_floor, 1e-3) * scale
+    profile.unit = profile.character_height / 1.75
+
+    for S, (end, upper, lower) in leg_sides.items():
+        profile.legs[S] = _skeleton_limb("leg", S, upper, lower, end, A, scale, rest_floor)
+    for S, (end, upper, lower) in arm_sides.items():
+        profile.arms[S] = _skeleton_limb("arm", S, upper, lower, end, A, scale, rest_floor)
+    _com_segments(profile, bones)
     return profile
 
 
-def _build_limb(bones, kind: str, S: str, scale: float, rest_floor: float) -> LimbSpec | None:
+def _skeleton_limb(kind: str, S: str, upper, lower, end, A: np.ndarray, scale: float, rest_floor: float) -> LimbSpec:
+    limb = LimbSpec(
+        kind=kind, side=S, ik_ctrl=end.name, pole_ctrl="", ik_base_ctrl="", switch_bone="",
+        org_upper=upper.name, org_lower=lower.name, org_end=end.name,
+        upper_len=max((lower.head_local - upper.head_local).length, 1e-5) * scale,
+        lower_len=max((end.head_local - lower.head_local).length, 1e-5) * scale,
+    )
+    limb.end_radius = 0.35 * end.length * scale
+    if kind == "leg":
+        toe = _toe_of(end)
+        limb.org_toe = toe.name if toe is not None else ""
+        _foot_geometry(limb, end, toe, None, A, scale, rest_floor)
+    return limb
+
+
+def _uz(A: np.ndarray, p) -> float:
+    """Upright height of an armature-space point."""
+    return float(A[2] @ np.array(p, dtype=np.float64))
+
+
+def _build_limb(bones, kind: str, S: str, scale: float, rest_floor: float, A: np.ndarray) -> LimbSpec | None:
     if kind == "leg":
         ik = f"foot_ik.{S}"
         upper, lower, end = f"ORG-thigh.{S}", f"ORG-shin.{S}", f"ORG-foot.{S}"
@@ -272,30 +513,45 @@ def _build_limb(bones, kind: str, S: str, scale: float, rest_floor: float) -> Li
     limb.org_toe = _first(bones, f"ORG-toe.{S}")
     limb.toe_ctrl = _first(bones, f"toe_ik.{S}", f"toe.{S}")
     limb.heel_ctrl = _first(bones, f"foot_heel_ik.{S}")
-    inv_end = np.linalg.inv(m_end)
-    ankle = np.array(b_end.head_local)
-    ball = np.array(b_end.tail_local)
-    toe_tip = None
-    if limb.org_toe:
-        b_toe = bones[limb.org_toe]
-        ball = np.array(b_toe.head_local)
-        toe_tip = np.array(b_toe.tail_local)
-
-    forward = ball - ankle
-    forward[2] = 0.0
-    n = np.linalg.norm(forward)
-    forward = forward / n if n > 1e-6 else np.array([0.0, -1.0, 0.0])
-    lateral = np.cross(forward, np.array([0.0, 0.0, 1.0]))
-
     heel_marker = None
     for child in b_end.children:
         if child.name.startswith("ORG-") and "heel" in child.name.lower() and not child.children:
             heel_marker = child
             break
+    _foot_geometry(limb, b_end, bones[limb.org_toe] if limb.org_toe else None, heel_marker, A, scale, rest_floor)
+    return limb
+
+
+def _foot_geometry(limb: LimbSpec, b_end, b_toe, heel_marker, A: np.ndarray, scale: float, rest_floor: float) -> None:
+    """Sole points, toe hinge and heel of a foot. Measured upright (``A``: armature -> upright rotation; the
+    floor ``rest_floor`` is an upright height), stored in the foot bone's own space."""
+    m_end = _np4(b_end.matrix_local)
+    inv_end = np.linalg.inv(m_end)
+    up = np.array([0.0, 0.0, 1.0])
+
+    def U(p):                                          # armature -> upright
+        return A @ np.array(p, dtype=np.float64)
+
+    def to_local(inv_m, p_up):                         # upright point -> bone space
+        return (inv_m @ np.append(A.T @ p_up, 1.0))[:3]
+
+    ankle = U(b_end.head_local)
+    ball = U(b_end.tail_local)
+    toe_tip = None
+    if b_toe is not None:
+        ball = U(b_toe.head_local)
+        toe_tip = U(b_toe.tail_local)
+
+    forward = ball - ankle
+    forward[2] = 0.0
+    n = np.linalg.norm(forward)
+    forward = forward / n if n > 1e-6 else np.array([0.0, -1.0, 0.0])
+    lateral = np.cross(forward, up)
+
     foot_len_xy = max(float(np.linalg.norm((ball - ankle)[:2])), 1e-4)
     if heel_marker is not None:
-        h_in = np.array(heel_marker.head_local)
-        h_out = np.array(heel_marker.tail_local)
+        h_in = U(heel_marker.head_local)
+        h_out = U(heel_marker.tail_local)
         half_w = 0.5 * float(np.linalg.norm((h_out - h_in)[:2]))
         lat = (h_out - h_in)
         lat[2] = 0.0
@@ -309,25 +565,21 @@ def _build_limb(bones, kind: str, S: str, scale: float, rest_floor: float) -> Li
     heel_c[2] = rest_floor
     ball_c = ball.copy()
     ball_c[2] = rest_floor
-    pts_arm = np.stack([
+    pts = np.stack([
         heel_c - lateral * half_w,
         heel_c + lateral * half_w,
         ball_c - lateral * half_w * 1.15,
         ball_c + lateral * half_w * 1.15,
     ])
-
-    def to_local(inv_m, p):
-        return (inv_m @ np.append(p, 1.0))[:3]
-
-    limb.sole_points = np.stack([to_local(inv_end, p) for p in pts_arm])
-    joint_height = float(np.clip(ball[2] - rest_floor, 0.0, 0.35 * foot_len_xy)) if limb.org_toe else 0.0
+    limb.sole_points = np.stack([to_local(inv_end, p) for p in pts])
+    joint_height = float(np.clip(ball[2] - rest_floor, 0.0, 0.35 * foot_len_xy)) if b_toe is not None else 0.0
     limb.sole_radius = np.array([0.0, 0.0, joint_height, joint_height])
-    limb.up_local = inv_end[:3, :3] @ np.array([0.0, 0.0, 1.0])
+    limb.up_local = inv_end[:3, :3] @ (A.T @ up)
     limb.heel_local = to_local(inv_end, heel_c)
     limb.ball_local = to_local(inv_end, ball_c)
-    limb.lateral_local = inv_end[:3, :3] @ lateral
+    limb.lateral_local = inv_end[:3, :3] @ (A.T @ lateral)
     if toe_tip is not None:
-        m_toe = _np4(bones[limb.org_toe].matrix_local)
+        m_toe = _np4(b_toe.matrix_local)
         tip = toe_tip.copy()
         tip[2] = rest_floor
         limb.toe_tip_local = to_local(np.linalg.inv(m_toe), tip)
@@ -336,7 +588,6 @@ def _build_limb(bones, kind: str, S: str, scale: float, rest_floor: float) -> Li
     else:
         limb.foot_length = float(np.linalg.norm((ball_c - heel_c)[:2])) * scale
     limb.end_radius = max(float(ankle[2] - rest_floor), 0.0) * scale
-    return limb
 
 
 def sole_contacts(limb: LimbSpec, W: np.ndarray) -> np.ndarray:

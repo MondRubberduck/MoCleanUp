@@ -121,7 +121,7 @@ def begin_edit(rig, upstream: bool = True) -> bool:
 def remember_chains(rig) -> None:
     """The take as it arrives: which limbs have their IK and FK chain in agreement (``chain_sync``)."""
     profile = profile_of(rig)
-    if profile.is_supported:
+    if profile.kind == "RIGIFY":                       # a plain skeleton has one chain per limb
         chain_sync.remember(rig, profile)
 
 
@@ -129,7 +129,7 @@ def sync_chains(rig) -> list[str]:
     """After an edit: the FK chains of those limbs follow the result. Never fails an edit that is done."""
     try:
         profile = profile_of(rig)
-        return chain_sync.sync(rig, profile) if profile.is_supported else []
+        return chain_sync.sync(rig, profile) if profile.kind == "RIGIFY" else []
     except Exception as exc:
         print(f"MoCap Cleanup: could not re-sync the FK chains ({exc})")
         return []

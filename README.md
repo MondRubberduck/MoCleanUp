@@ -1,8 +1,10 @@
 # MoCap Cleanup Studio
 
-A Blender extension that cleans up motion capture on **Rigify control rigs** (including rigs built with
-Rig-Bridge) in six stages: diagnose, filter, de-drift, pin, body fixes, key reduction. It works on the
-action that is already on the rig. It does not retarget and it does not build rigs.
+A Blender extension that cleans up motion capture in six stages: diagnose, filter, de-drift, pin, body
+fixes, key reduction. It works on **Rigify control rigs** (including rigs built with Rig-Bridge) and on
+**plain skeletons** as they come out of the capture software (Motive / OptiTrack, Mixamo, Unreal,
+Character Creator FBX or BVH), before any control rig exists. It works on the action that is already
+there. It does not retarget and it does not build rigs.
 
 Blender 5.0 or newer (slotted actions). Tested on 5.2 and 5.3. NumPy only, no extra packages.
 
@@ -14,7 +16,7 @@ To build the zip yourself: `blender -c extension build --source-dir . --output-d
 
 ## Five-minute start
 
-1. Select the animated Rigify rig.
+1. Select the animated rig or skeleton.
 2. `Window > MoCap Cleanup` in the top bar. This opens the workspace: viewport on top, Dope Sheet with
    the pin tracks and the Graph Editor below, and the **MoCap** tab in every sidebar (`N`).
 3. Pick the **Source** (Optical / Inertial Suit / Video) and press **Clean Up Take**. That runs repair,
@@ -98,9 +100,24 @@ and after the cleanup the FK chain follows that too.
 
 ### Which rig
 
-Select the control rig, or the character mesh, or the game skeleton: a mesh stands for its armature, and
+Select the control rig, or the character mesh, or the skeleton: a mesh stands for its armature, and
 a skeleton driven by another armature's constraints stands for that rig (cleaning the skeleton's own
 action would change nothing that is seen).
+
+### Before a control rig: plain skeletons
+
+A skeleton without controls can be cleaned as it is, before Rig Bridge or a retargeter builds a control
+rig on it. The panel says *Skeleton: no control rig needed*. MoCap finds the hips (the bone both thighs
+hang from), the legs, the arms, the spine and the head by the usual names (`LeftUpLeg`, `thigh_l`,
+`LThigh`, `CC_Base_L_Thigh`, `mixamorig:` and other prefixes) and checks them by the shape of the
+skeleton. An FBX import turned 90 degrees and scaled to 0.01 is fine.
+
+Every step works on it. Pins, the floor and the body fixes are solved the same way as on a control
+rig and then written back as rotations of the hips, thigh / shin / foot, upper arm / forearm / hand
+and toe bones by a two-bone IK of the add-on's own: the legs keep their feet where the solve puts them
+when the hips move, the arms go along with the body. Bone lengths and location keys stay as they
+are (only the hips move), and *Clear Solve* / *Restore Raw* give the take back exactly. A skeleton has
+no heel bone: the sole is estimated from the ankle and the toes.
 
 ## Overlays
 
@@ -121,8 +138,9 @@ action would change nothing that is seen).
 
 ## Limits
 
-* Stages 3 to 5 need Rigify's IK controls (`torso`, `foot_ik.L/R`, `hand_ik.L/R`). Stages 1, 2 and 6
-  work on any armature.
+* Stages 3 to 5 need Rigify's IK controls (`torso`, `foot_ik.L/R`, `hand_ik.L/R`) or a humanoid
+  skeleton (two legs hanging from the hips; the limb joints must follow each other directly, twist
+  bones as side branches are fine). Stages 1, 2 and 6 work on any armature.
 * One action layer and one strip per action (what Blender creates by default).
 * Body collision uses capsules built from the rig, not the mesh. It is off by default.
 * Ballistic jump correction is off by default; it moves the whole body and wants a look afterwards.
@@ -138,7 +156,8 @@ action would change nothing that is seen).
 tests/run.sh "/path/to/blender"
 ```
 
-Ten headless test files (68 tests) on a generated Rigify human, plus a static name check. See
+Eleven headless test files (76 tests) on a generated Rigify human and a plain skeleton baked from it,
+plus a static name check. See
 `HANDOFF.md` for the layout of the code and for what a GUI session is needed to verify.
 
 To see what the installed extension does to one of your own takes without opening Blender:

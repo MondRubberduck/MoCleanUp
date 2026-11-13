@@ -66,6 +66,8 @@ def write_world_groups(rig, groups: list[dict[str, np.ndarray]], f0: int, f1: in
 def body_controls(rig, profile) -> list[list[str]]:
     """Controls that carry the whole character in world space, in write order."""
     bones = rig.pose.bones
+    if profile.kind == "SKELETON":                     # everything hangs from the hips
+        return [[profile.torso_ctrl] if profile.torso_ctrl in bones else [], [], []]
     iks = [l.ik_ctrl for l in profile.limbs() if l.ik_ctrl in bones]
     poles = [l.pole_ctrl for l in profile.limbs() if l.pole_ctrl and l.pole_ctrl in bones]
     torso = [profile.torso_ctrl] if profile.torso_ctrl in bones else []

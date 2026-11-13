@@ -14,6 +14,11 @@ Order of operations (each step sees the result of the previous ones):
 6. pole targets re-aimed (and de-spiked) for the corrected limbs, toes kept above the floor
 7. world targets -> local control channels; FK limbs that received corrections are switched to IK
    inside the affected windows
+
+On a plain skeleton (no control rig yet, ``RigProfile.kind == "SKELETON"``) steps 1-6 are the same; the legs
+act like IK legs (their feet keep their place in the world when the hips move) and the arms like FK arms (they
+go along with the body). Step 7 is a two-bone IK of the solver's own: the targets become rotations of the
+hips, thigh / shin / foot, upper arm / forearm / hand and toe bones (``_write_skeleton``).
 """
 
 from __future__ import annotations
@@ -132,6 +137,15 @@ def solver_channel_paths(rig, profile: RigProfile) -> list[str]:
     """Data paths of every curve the solver may write (the 'solve layer')."""
     paths: list[str] = []
     bones = rig.pose.bones
+    if profile.kind == "SKELETON":
+        if profile.torso_ctrl in bones:
+            paths.append(action_io.bone_data_path(profile.torso_ctrl, "location"))
+            paths.append(action_io.rotation_data_path(rig, profile.torso_ctrl))
+        for limb in profile.limbs():
+            for n in (limb.org_upper, limb.org_lower, limb.org_end, limb.org_toe):
+                if n and n in bones:
+                    paths.append(action_io.rotation_data_path(rig, n))
+        return sorted(set(paths))
 
     def add_loc(n):
         if n and n in bones:
@@ -250,12 +264,14 @@ def sample_for_solver(rig, profile: RigProfile, f0: int, f1: int, targets, use_c
     scene = bpy.context.scene
     samples = sampler.sample_objects(list(requests.values()), f0, f1, scene)
 
-    ctrls = []
-    for limb in profile.limbs():
-        ctrls += [limb.ik_ctrl, limb.pole_ctrl, limb.toe_ctrl]
-    ctrls = [c for c in ctrls if c]
-    drivers = [profile.torso_ctrl] + [limb.ik_ctrl for limb in profile.limbs()]
-    follow = sampler.probe_follow(rig, drivers, ctrls)
+    follow: dict = {}
+    if profile.kind != "SKELETON":                     # a skeleton has no controls that follow others
+        ctrls = []
+        for limb in profile.limbs():
+            ctrls += [limb.ik_ctrl, limb.pole_ctrl, limb.toe_ctrl]
+        ctrls = [c for c in ctrls if c]
+        drivers = [profile.torso_ctrl] + [limb.ik_ctrl for limb in profile.limbs()]
+        follow = sampler.probe_follow(rig, drivers, ctrls)
     runtime.SOLVE_SAMPLES[rig.name] = (token, samples, follow)
     return samples, follow, True
 
@@ -280,12 +296,21 @@ def solve(rig, pins: list[s4.KinematicPin], settings: SolveSettings | None = Non
     fps = scene_fps()
     unit = profile.unit
     scale = profile.scale
+    skeleton = profile.kind == "SKELETON"
     pins = [p for p in pins if p.enabled] if st.use_pins else []
 
     paths = prepare_base(rig, profile)
     targets = _pin_targets(pins, rig)
     samples, follow, res.resampled = sample_for_solver(rig, profile, f0, f1, targets, use_cache)
     smp = samples[rig.name]
+    if skeleton:
+        # A skeleton's limbs are as long as the take makes them (location keys can stretch a chain): measure.
+        from dataclasses import replace
+        for side_map in (profile.legs, profile.arms):
+            for S, limb in list(side_map.items()):
+                r, m, e = (smp.head_w(n) for n in (limb.org_upper, limb.org_lower, limb.org_end))
+                side_map[S] = replace(limb, upper_len=float(np.median(np.linalg.norm(m - r, axis=1))),
+                                      lower_len=float(np.median(np.linalg.norm(e - m, axis=1))))
 
     depsgraph = bpy.context.evaluated_depsgraph_get()
     floor_obj = bpy.data.objects.get(st.floor_object) if st.floor_object else None
@@ -320,8 +345,12 @@ def solve(rig, pins: list[s4.KinematicPin], settings: SolveSettings | None = Non
     for limb in profile.limbs():
         W_ik = smp.world_m(limb.ik_ctrl)
         W_end = smp.world_m(limb.org_end)
-        ikfk = (action_io.read_bone_prop_curve(rig, limb.switch_bone, "IK_FK", f0, f1)
-                if limb.switch_bone else np.zeros(T))
+        if skeleton:
+            # legs like IK legs (the feet stay where they are when the hips move), arms like FK arms
+            ikfk = np.zeros(T) if limb.kind == "leg" else np.ones(T)
+        else:
+            ikfk = (action_io.read_bone_prop_curve(rig, limb.switch_bone, "IK_FK", f0, f1)
+                    if limb.switch_bone else np.zeros(T))
         ikmode = ikfk < 0.5
         root0 = smp.head_w(limb.org_upper)
         mid0 = smp.head_w(limb.org_lower)
@@ -626,7 +655,8 @@ def solve(rig, pins: list[s4.KinematicPin], settings: SolveSettings | None = Non
     # ---- decide which limbs changed and need IK ------------------------------------------------------------------------
     cb_dirty = False
     G_torso_pose = smp.obj_world_inv @ D_torso @ smp.obj_world
-    torso_changed = float(np.abs(D_torso - np.eye(4)).max()) > 1e-7
+    torso_moved = np.abs(D_torso - np.eye(4)).max(axis=(1, 2)) > 1e-7
+    torso_changed = bool(torso_moved.any())
     planted_out = {}
     for k, L in limbs.items():
         limb = L["limb"]
@@ -635,10 +665,12 @@ def solve(rig, pins: list[s4.KinematicPin], settings: SolveSettings | None = Non
         dpos = np.linalg.norm(L["pos"] - carried_pos, axis=1)
         drot = quat_angle_between(L["quat"], carried_quat)
         need = (dpos > 2e-5 * unit) | (drot > 2e-4) | (L["pin_w"] > 0.0)
+        if skeleton and not L["follows"].all():
+            need |= torso_moved                        # a leg hangs from the hips: it is solved wherever they move
         L["need"] = need
         L["changed"] = bool(np.any((dpos > 1e-6 * unit) | (drot > 1e-5)))
         planted_out[k] = L["planted"]
-        fk_need = need & ~L["ikmode"]
+        fk_need = need & ~L["ikmode"] & (not skeleton)
         L["activate"] = bool(fk_need.any())
         if L["activate"]:
             mask = np.zeros(T)
@@ -675,6 +707,10 @@ def solve(rig, pins: list[s4.KinematicPin], settings: SolveSettings | None = Non
 
     if torso_changed:
         write_ctrl(torso, D_torso @ W_torso0, parent_pose_of(torso))
+
+    if skeleton:
+        cb_dirty |= _write_skeleton(rig, profile, smp, limbs, G_torso_pose, st, fps, floor, res, toe_geometry, sole_world)
+        limbs = {}                                     # nothing for the control writers below
 
     # ---- write: IK controls -------------------------------------------------------------------------------------------------------
     deferred_ik = []
@@ -803,6 +839,120 @@ def solve(rig, pins: list[s4.KinematicPin], settings: SolveSettings | None = Non
     runtime.SOLVE_RESULTS[rig.name] = res
     runtime.MOTION.setdefault(rig.name, {}).update({"f0": f0, "planted": planted_out, "stale": True})
     return res
+
+
+def _two_bone(root, target, a, b, bend):
+    """Knee / elbow ``(T, 3)`` and the reachable end ``(T, 3)`` of a two-bone chain from ``root`` toward
+    ``target`` with segment lengths ``a`` and ``b`` (per frame), bending toward ``bend`` (unit, any length along
+    the axis is ignored)."""
+    v = target - root
+    d = np.linalg.norm(v, axis=1)
+    axis = v / np.maximum(d, 1e-12)[:, None]
+    d_c = np.clip(d, np.abs(a - b) * (1.0 + 1e-6) + 1e-9, (a + b) * (1.0 - 1e-7))
+    x = (a * a - b * b + d_c * d_c) / (2.0 * d_c)
+    h = np.sqrt(np.maximum(a * a - x * x, 0.0))
+    side = bend - np.sum(bend * axis, axis=1, keepdims=True) * axis
+    side = side / np.maximum(np.linalg.norm(side, axis=1, keepdims=True), 1e-12)
+    return root + x[:, None] * axis + h[:, None] * side, root + d_c[:, None] * axis
+
+
+def _frame(u: np.ndarray, n: np.ndarray) -> np.ndarray:
+    """Orthonormal frames ``(T, 3, 3)`` with columns u, n (made perpendicular to u), u x n."""
+    u = u / np.maximum(np.linalg.norm(u, axis=1, keepdims=True), 1e-12)
+    n = n - np.sum(n * u, axis=1, keepdims=True) * u
+    n = n / np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-12)
+    return np.stack([u, n, np.cross(u, n)], axis=2)
+
+
+def _write_skeleton(rig, profile: RigProfile, smp, limbs: dict, G_torso_pose: np.ndarray, st: SolveSettings, fps: float,
+                    floor, res: SolveResult, toe_geometry, sole_world) -> bool:
+    """World targets of a plain skeleton -> rotations of its limb bones (two-bone IK, see the module notes).
+
+    Each limb is solved only on the frames that need it; elsewhere its keys stay exactly as they were. The
+    chain is first carried along with whatever moved the hips; then the upper bone turns about its head so
+    that the middle joint lands where the IK puts it, the lower bone so that the end reaches the target, and
+    each keeps its twist relative to the bend plane. The end bone takes the target orientation."""
+    f0, f1 = smp.f0, smp.f1
+    T = smp.T
+    torso = profile.torso_ctrl
+    bones = rig.data.bones
+    W_obj, W_inv = smp.obj_world, smp.obj_world_inv
+    under_torso = {d.name for d in bones[torso].children_recursive} | {torso}
+    dirty = False
+
+    def new_parent_pose(name):
+        pn = sampler.parent_name(rig, name)
+        if not pn or not smp.has(pn):
+            return None
+        return G_torso_pose @ smp.pose_m(pn) if pn in under_torso else smp.pose_m(pn)
+
+    def write_rot(name, pose_new, parent_new, mask):
+        nonlocal dirty
+        _loc, q_new = sampler.pose_to_basis(rig, name, pose_new, parent_new)
+        cur = action_io.read_bone_local_channels(rig, name, f0, f1)
+        q_cur = cur["quat"]
+        q_new = np.where(np.sum(q_new * q_cur, axis=1, keepdims=True) < 0.0, -q_new, q_new)
+        q = np.where(mask[:, None], q_new, q_cur)
+        if float(quat_angle_between(q, q_cur).max()) > 1e-5:
+            action_io.write_bone_local_channels(rig, name, f0, quat=q)
+            res.written.append(name)
+            dirty = True
+
+    for k, L in limbs.items():
+        limb = L["limb"]
+        need = L["need"]
+        toe_on = (limb.kind == "leg" and st.clip_toes and st.use_floor and limb.org_toe and smp.has(limb.org_toe))
+        if not need.any() and not toe_on:
+            continue
+        up, lo, end = limb.org_upper, limb.org_lower, limb.org_end
+        P_par_new = new_parent_pose(up)
+        pn = sampler.parent_name(rig, up)
+        G = (P_par_new @ np.linalg.inv(smp.pose_m(pn))) if (P_par_new is not None) else np.tile(np.eye(4), (T, 1, 1))
+        C_up, C_lo, C_end = (W_obj @ G @ smp.pose_m(n) for n in (up, lo, end))     # carried along, world
+        root, mid_c, end_c = C_up[:, :3, 3], C_lo[:, :3, 3], C_end[:, :3, 3]
+        a = np.linalg.norm(mid_c - root, axis=1)
+        b = np.linalg.norm(end_c - mid_c, axis=1)
+        # bend direction: the take's, carried to the new axis (whips of the bend plane smoothed like a pole's)
+        length = np.maximum(a + b, 1e-9)
+        pole, _ = s5.retarget_pole(L["root0"], L["W_end"][:, :3, 3], L["bend0"], root, L["pos"], a / length, 0.5 * length,
+                                   fps=fps, smooth_cutoff=st.pole_smooth_hz if st.use_pole_fix else 0.0)
+        knee, reach = _two_bone(root, L["pos"], a, b, pole - root)
+        L["pos"] = np.where(need[:, None], reach, L["pos"])
+        bend_c = s5.limb_bend_direction(root, mid_c, end_c)
+        axis_c = end_c - root
+        axis_n = reach - root
+        n_old = np.cross(axis_c, bend_c)
+        n_new = np.cross(axis_n, knee - root)
+        straight = np.linalg.norm(n_new, axis=1) < 1e-9 * np.maximum(length, 1e-9) ** 2
+        n_new = np.where(straight[:, None], np.cross(axis_n, pole - root), n_new)
+        R_up = _frame(knee - root, n_new) @ np.swapaxes(_frame(mid_c - root, n_old), 1, 2)
+        R_lo = _frame(reach - knee, n_new) @ np.swapaxes(_frame(end_c - mid_c, n_old), 1, 2)
+        W_up = C_up.copy()
+        W_up[:, :3, :3] = R_up @ C_up[:, :3, :3]
+        W_lo = C_lo.copy()
+        W_lo[:, :3, :3] = R_lo @ C_lo[:, :3, :3]
+        W_lo[:, :3, 3] = knee
+        W_end = _compose(reach, L["quat"], profile.scale)
+        P_up, P_lo, P_end = W_inv @ W_up, W_inv @ W_lo, W_inv @ W_end
+        if need.any():
+            write_rot(up, P_up, P_par_new, need)
+            write_rot(lo, P_lo, np.where(need[:, None, None], P_up, G @ smp.pose_m(up)), need)
+            write_rot(end, P_end, np.where(need[:, None, None], P_lo, G @ smp.pose_m(lo)), need)
+        if toe_on:
+            D_E, joint, tip, axis, upv = toe_geometry(L)
+            gamma = toe_lift_angle(joint, tip, axis, floor, st.floor_cushion, up=upv)
+            ball = sole_world(k)[:, 2:]
+            near = np.clip(1.5 - (ball[..., 2] - floor.height(ball)).min(axis=1) / (0.02 * profile.unit), 0.0, 1.0)
+            gamma = gamma + toe_rest_angle(joint, tip, axis, floor, L["planted"] * near, st.floor_cushion, up=upv)
+            bent = np.abs(gamma) > 1e-5
+            res.toe_frames += int(np.count_nonzero(np.abs(gamma) > np.radians(0.2)))
+            if bent.any() or need.any():
+                R = np.tile(np.eye(4), (T, 1, 1))
+                R[:, :3, :3] = quat_to_matrix(quat_axis_angle(axis, gamma))
+                W_toe = _translation(joint) @ R @ _translation(-joint) @ D_E @ smp.world_m(limb.org_toe)
+                foot_new = np.where(need[:, None, None], P_end, G @ smp.pose_m(end))
+                write_rot(limb.org_toe, W_inv @ W_toe, foot_new, need | bent)
+    return dirty
 
 
 def world_gravity(profile: RigProfile) -> float:
