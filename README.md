@@ -37,7 +37,7 @@ back the whole take, a frame range, or only the selected bones.
 | **3 Drift** | Slow sliding of the whole body, invisible stairs, loops that do not close | Zero-velocity updates at planted feet, floor levelling per step, loop closure with matching pose and velocity. Meant for inertial suits and video capture. |
 | **4 Pins** | Sliding feet, hands that should hold on to something, limbs below the floor | Kinematic Pins (see below), automatic contact detection, floor clipping for soles, toes and wrists. |
 | **5 Body** | Knee and elbow pops, IK snapping at full stretch, pole flips, jumps that ignore gravity, hands inside the body | The reach the take has is the reference: only what an edit adds, a target the limb cannot reach and measured pops are softened, so a straight leg stays straight. A foot below the floor under a straight leg raises the body instead of bending the knee. The hips give way only for pins made by hand, pops, or targets out of reach. Optional heel peel, pole targets re-aimed and de-spiked, ballistic flight arcs for the centre of mass, capsule push-out. |
-| **6 Keys** | Thousands of keys per bone | Error-bounded sparse Bezier keys. Optionally (*Residual Detail Layer*, off by default) what the sparse curves do not reproduce goes to an NLA track; other tools that read the action (re-bakes, retargeting, export) leave that track behind. |
+| **6 Keys** | Thousands of keys per bone | Error-bounded sparse Bezier keys. Every curve stays within *Location* / *Rotation*, and the rig's joints stay within 2.5 × *Location* (5 mm by default) of the dense take: small errors add up along a chain (most at a knee near full reach), so where a joint would drift further, the controls that move it get more keys there. The report gives the largest joint error ("joints within 4.8 mm of the dense take"). Optionally (*Residual Detail Layer*, off by default) what the sparse curves do not reproduce goes to an NLA track instead, which is exact; other tools that read the action (re-bakes, retargeting, export) leave that track behind. |
 
 ### Pins
 
@@ -71,7 +71,8 @@ is; feet below the floor are still lifted.
 The feet are measured on the character mesh: a rig built for a game skeleton has its sole points 2-3 cm
 above the shoe. MoCap Cleanup finds the meshes deformed by the rig (also through a skeleton constrained
 to it), measures how far the mesh rests below the rig's sole points ("mesh sole 2.6 cm below the rig's"),
-and keeps the rig's soles that much above the floor. Choose a mesh as **Terrain** for uneven ground.
+and keeps the rig's soles that much above the floor. Only vertices weighted to a bone count: loose vertices
+that don't move with the character say nothing about its feet. Choose a mesh as **Terrain** for uneven ground.
 
 ### Solve
 
@@ -85,7 +86,9 @@ A take baked onto a control rig (Rig Bridge, a retargeter) often has the IK *and
 so the IK/FK switch works on every frame. When both chains arrive in agreement, MoCap Cleanup keeps them
 together after every edit: where IK is active the FK controls follow the result, where FK is active the
 IK control and pole follow it. The chain that is never active is not analysed. Limbs whose chains do
-not agree to begin with are left as they are.
+not agree to begin with (at the hand or foot) are left as they are. An IK chain can't bend a knee or
+elbow backwards: where the take has one over-straight, the rig's IK bends it forwards by the same angle,
+and after the cleanup the FK chain follows that too.
 
 ### Which rig
 
