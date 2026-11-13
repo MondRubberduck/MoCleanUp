@@ -8,7 +8,7 @@ Blender 5.0 or newer (slotted actions). Tested on 5.2 and 5.3. NumPy only, no ex
 
 ## Install
 
-Download `mocap_cleanup-1.1.0.zip` from the [Releases page](https://github.com/MondRubberduck/MoCleanUp/releases/latest), then
+Download `mocap_cleanup-1.2.0.zip` from the [Releases page](https://github.com/MondRubberduck/MoCleanUp/releases/latest), then
 `Edit > Preferences > Get Extensions > ▾ > Install from Disk…` and pick it (or drag it into the Blender window).
 To build the zip yourself: `blender -c extension build --source-dir . --output-dir dist`.
 
@@ -132,7 +132,7 @@ action would change nothing that is seen).
 tests/run.sh "/path/to/blender"
 ```
 
-Ten headless test files (59 tests) on a generated Rigify human, plus a static name check. See
+Ten headless test files (68 tests) on a generated Rigify human, plus a static name check. See
 `HANDOFF.md` for the layout of the code and for what a GUI session is needed to verify.
 
 To see what the installed extension does to one of your own takes without opening Blender:
