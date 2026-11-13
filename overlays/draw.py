@@ -17,7 +17,7 @@ from mathutils import Vector
 from ..core import action_io, raw_snapshot, runtime
 from ..core.rig_inspector import sole_contacts
 from ..ui import common
-from . import pin_tracks
+from . import editor_track, pin_tracks
 
 ISSUE_COLORS = {
     "FLIP": (0.95, 0.22, 0.20),
@@ -101,12 +101,12 @@ def _visible_issue(issue, selected: set[str] | None) -> bool:
     return selected is None or not issue.bone or issue.bone in selected
 
 
-def _draw_marks(context, region, rig, st) -> None:
+def _draw_marks(context, region, rig, st, selected_only: bool = False) -> None:
     data = rig.mocap_cleanup
     if not len(data.issues):
         return
     x0, per_frame, _y0, _sy = pin_tracks.view_mapping(region)
-    selected = set(action_io.selected_pose_bone_names(rig)) if st.marks_only_selected else None
+    selected = set(action_io.selected_pose_bone_names(rig)) if (st.marks_only_selected or selected_only) else None
     s = pin_tracks.ui_scale(context)
     h = region.height
     by_kind: dict[str, list] = {}
@@ -238,6 +238,17 @@ def _draw_tracks(context, region, rig) -> None:
 
 def draw_anim_overlays(context, region, rig, st, graph: bool) -> None:
     """Error marks, ghost curves (Graph Editor only) and pin tracks in pixel space of ``region``."""
+    screen = context.screen
+    if screen is not None and screen.get("mocap_editor", False):
+        # The MoCap Editor window: the problem track and the pins in its Dope Sheet; in its Graph Editor the
+        # marks of the bones on show (not every bone's, they would cover the whole editor) and the raw ghost.
+        if graph:
+            _draw_marks(context, region, rig, st, selected_only=True)
+            _draw_ghosts(context, region, rig)
+        else:
+            editor_track.draw(context, region, rig, _rects, _lines, _text)
+            _draw_tracks(context, region, rig)
+        return
     if st.show_heatmap:
         _draw_marks(context, region, rig, st)
     if st.show_ghost and graph:

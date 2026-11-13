@@ -94,6 +94,11 @@ def _header(layout, st, rig):
     row.prop(st, "preset", text="")
     row.operator("mocap.apply_preset", text="", icon="CHECKMARK")
     row.operator("mocap.workspace_setup", text="", icon="WORKSPACE")
+    screen = getattr(bpy.context, "screen", None)
+    if not (screen is not None and screen.get("mocap_editor", False)):
+        row = layout.row()
+        row.scale_y = 1.2
+        row.operator("mocap.editor_open", icon="WINDOW")
     return True
 
 
@@ -418,18 +423,22 @@ class _MainPanel:
         rig = common.get_rig(context)
         if not _header(layout, st, rig):
             return
-        tabs = layout.column(align=True)
-        for idents in (("DIAGNOSE", "FILTER", "DRIFT"), ("CONTACTS", "PHYSICS", "SIMPLIFY")):
-            row = tabs.row(align=True)
-            for ident in idents:
-                row.prop_enum(st, "stage", ident)
-        _wrapped(layout, context, st.bl_rna.properties["stage"].enum_items[st.stage].description)
-        needs_rigify = st.stage in {"DRIFT", "CONTACTS", "PHYSICS"}
-        body = layout.column()
-        if needs_rigify and not common.profile_of(rig).is_supported and st.stage != "DRIFT":
-            body.label(text="This stage needs Rigify IK controls", icon="ERROR")
-        else:
-            STAGE_DRAW[st.stage](body, context, st, rig)
+        # The steps top to bottom in the order they are done; the open one shows its settings right under
+        # it (GUI feedback: a 2 x 3 grid of tabs did not say where to start or what comes next).
+        items = st.bl_rna.properties["stage"].enum_items
+        for ident in ("DIAGNOSE", "FILTER", "DRIFT", "CONTACTS", "PHYSICS", "SIMPLIFY"):
+            is_open = st.stage == ident
+            row = layout.row(align=True)
+            row.scale_y = 1.15
+            row.prop_enum(st, "stage", ident, icon="DOWNARROW_HLT" if is_open else "RIGHTARROW")
+            if not is_open:
+                continue
+            box = layout.box()
+            _wrapped(box, context, items[ident].description)
+            if ident in {"CONTACTS", "PHYSICS"} and not common.profile_of(rig).is_supported:
+                box.label(text="This step needs Rigify IK controls", icon="ERROR")
+            else:
+                STAGE_DRAW[ident](box, context, st, rig)
         text = common.result_for(rig)
         if text:
             _wrapped(layout.box(), context, text)

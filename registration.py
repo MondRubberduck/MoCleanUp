@@ -8,10 +8,11 @@ from bpy.app.handlers import persistent
 from . import props
 from .core import raw_snapshot, runtime, sampler
 from .overlays import draw, pin_tracks
-from .ui import autosolve, operators, panels, workspace
+from .ui import autosolve, editor, operators, panels, workspace
 
 _keymaps: list[tuple] = []
-CLASSES = (*operators.CLASSES, pin_tracks.MOCAP_OT_pin_track_edit, workspace.MOCAP_OT_workspace_setup, *panels.CLASSES)
+CLASSES = (*operators.CLASSES, pin_tracks.MOCAP_OT_pin_track_edit, workspace.MOCAP_OT_workspace_setup, *editor.CLASSES,
+           *panels.CLASSES)
 
 
 @persistent
@@ -25,6 +26,7 @@ def _on_load(_dummy=None):
 
 
 def _topbar_button(self, context):
+    self.layout.operator("mocap.editor_open", text="MoCap Editor", icon="WINDOW")
     self.layout.operator("mocap.workspace_setup", text="MoCap Cleanup", icon="WORKSPACE")
 
 
@@ -38,6 +40,8 @@ def _register_keymaps() -> None:
         for shift in (False, True):
             kmi = km.keymap_items.new("mocap.pin_track_edit", "LEFTMOUSE", "PRESS", shift=shift)
             _keymaps.append((km, kmi))
+    km = kc.keymaps.new(name="Dopesheet", space_type="DOPESHEET_EDITOR")
+    _keymaps.append((km, km.keymap_items.new("mocap.editor_track_click", "LEFTMOUSE", "PRESS")))
     for name, space in (("Dopesheet", "DOPESHEET_EDITOR"), ("Graph Editor", "GRAPH_EDITOR"), ("3D View", "VIEW_3D")):
         km = kc.keymaps.new(name=name, space_type=space)
         for key, direction in (("LEFT_BRACKET", -1), ("RIGHT_BRACKET", 1)):
@@ -69,6 +73,7 @@ def unregister() -> None:
     draw.unregister()
     autosolve.unregister()
     workspace.unregister()
+    editor.unregister()
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)
     props.unregister()

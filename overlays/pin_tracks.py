@@ -52,7 +52,12 @@ def ui_scale(context) -> float:
 def tracks_enabled(context, st) -> bool:
     """Are pin tracks shown (and editable) in the editor of ``context``?"""
     area = context.area
-    if area is None or st is None or not st.show_pin_tracks:
+    if area is None or st is None:
+        return False
+    screen = getattr(context, "screen", None)
+    if screen is not None and screen.get("mocap_editor", False):
+        return area.type == "DOPESHEET_EDITOR"       # the MoCap Editor shows its pins in the track, always
+    if not st.show_pin_tracks:
         return False
     if area.type == "GRAPH_EDITOR":
         return bool(st.show_pin_tracks_graph)
@@ -62,7 +67,10 @@ def tracks_enabled(context, st) -> bool:
 
 
 def layout(context, region, rig) -> dict:
-    """Pixel layout of the tracks in ``region``: rows and pin bars."""
+    """Pixel layout of the tracks in ``region``: rows and pin bars.
+
+    Normally the rows sit at the bottom of the editor. In the MoCap Editor they follow the problem rows
+    (``editor_track.pins_top``), so the two never cover each other."""
     data = rig.mocap_cleanup
     s = ui_scale(context)
     row_h = 17.0 * s
@@ -72,6 +80,10 @@ def layout(context, region, rig) -> dict:
     has_markers = scene is not None and len(scene.timeline_markers) > 0
     base = (44.0 if has_markers else 16.0) * s                 # scrollbar (+ marker line)
     top = base + len(owners) * (row_h + gap) - gap
+    screen = getattr(context, "screen", None)
+    if screen is not None and screen.get("mocap_editor", False):
+        from . import editor_track
+        top = editor_track.pins_top(context, region, rig)
     x0, per_frame, _y0, _sy = view_mapping(region)
 
     def fx(frame: float) -> float:

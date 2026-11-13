@@ -287,6 +287,23 @@ def test_overlays_render():
     print(f"   offscreen: marks, {seen} pin bars, ghost curve ({lit} px), HUD ({lit_hud} px)")
 
 
+def test_editor_track_rows():
+    """The MoCap Editor's problem track puts each bone in its body-part row; its operators are registered."""
+    from mocap_cleanup.overlays import editor_track
+    from mocap_cleanup.ui import common
+    rig, _gt, _st = ta.make_scene()
+    profile = common.profile_of(rig)
+    expect = {"f_index.01.L": "hand.L", "thumb.01.R": "hand.R", "neck": "head", "head": "head", "torso": "torso",
+              "foot_ik.R": "leg.R", "thigh_fk.L": "leg.L", "upper_arm_fk.L": "arm.L", "hand_ik.R": "arm.R"}
+    for bone, group in expect.items():
+        if rig.pose.bones.get(bone) is None:
+            continue
+        assert editor_track.group_of(profile, bone) == group, (bone, editor_track.group_of(profile, bone))
+    assert [g for g, _l in editor_track.GROUPS][0] == "head" and len(editor_track.GROUPS) == 9
+    for op in ("editor_open", "editor_track_click"):
+        assert hasattr(bpy.ops.mocap, op) and getattr(bpy.ops.mocap, op).get_rna_type() is not None
+
+
 def test_view_mapping_is_exact():
     """Tracks and marks sit on their frames at any zoom and pan (GUI feedback: they slid, collapsed onto
     frame 0 or vanished, because the scale came from two neighbouring frames in whole pixels)."""
@@ -319,4 +336,5 @@ def test_view_mapping_is_exact():
 
 
 if __name__ == "__main__":
-    run_tests([test_every_panel_layout, test_workspace_layout, test_overlays_render, test_view_mapping_is_exact])
+    run_tests([test_every_panel_layout, test_workspace_layout, test_overlays_render, test_view_mapping_is_exact,
+               test_editor_track_rows])
