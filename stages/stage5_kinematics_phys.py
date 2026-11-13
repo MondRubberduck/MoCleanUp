@@ -76,7 +76,14 @@ def reach_targets(root: np.ndarray, end: np.ndarray, length: float, r_max: float
         return soft
     keep = np.minimum(d, np.maximum(np.minimum(raw, length), soft))
     if soften is not None:
-        keep = keep + np.clip(soften, 0.0, 1.0) * (soft - keep)
+        w = np.clip(soften, 0.0, 1.0)
+        if np.any(w > 0.0):
+            # A pop is the reach dipping (or jumping) on single frames. Clamp the reach around it,
+            # not the dip itself: clamping each frame on its own pulled the popped frame further in
+            # than its neighbours, and the snap came out larger than it went in (QA E1: a straight
+            # leg's knee went 0.7 -> 2.4 cm off its path in one frame).
+            around = soft_reach(upper_envelope(d, 2) / max(length, 1e-9), r_max, softness) * length
+            keep = keep + w * (around - keep)
     return keep
 
 

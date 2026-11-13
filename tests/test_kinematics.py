@@ -53,6 +53,24 @@ def test_soft_reach_function():
     assert phi.min() > np.radians(10.0)
 
 
+def test_pop_window_levels_a_one_frame_dip():
+    """A straight leg whose foot comes 8 mm closer for one frame (a 16 degree knee pop): inside the pop
+    window the reach target is the reach around the pop, so the popped frame is not pulled in further
+    than its neighbours (QA E1)."""
+    T, length = 21, 0.782
+    root = np.zeros((T, 3))
+    d = np.full(T, length * 1.0004)
+    d[10] = length * 0.9897                              # the pop
+    end = np.stack([np.zeros(T), np.zeros(T), -d], axis=1)
+    soften = np.ones(T)
+    keep = s5.reach_targets(root, end, length, 0.995, 0.03, raw=d.copy(), soften=soften)
+    assert keep[10] >= keep[9] - 1e-6 and keep[10] >= keep[11] - 1e-6, (keep[9:12] / length)
+    assert np.all(keep <= 0.995 * length + 1e-9)
+    # outside a pop window nothing changes: the take's own reach is kept
+    keep0 = s5.reach_targets(root, end, length, 0.995, 0.03, raw=d.copy(), soften=np.zeros(T))
+    assert np.allclose(keep0, np.minimum(d, length))
+
+
 def test_knee_pops_with_planted_feet():
     rig = fresh_rig()
     set_limb_props(rig, ik_stretch=0.0, pole_vector=True)
@@ -343,7 +361,8 @@ def test_body_capsules():
 
 
 if __name__ == "__main__":
-    run_tests([test_soft_reach_function, test_knee_pops_with_planted_feet, test_a_straight_leg_stays_straight,
+    run_tests([test_soft_reach_function, test_pop_window_levels_a_one_frame_dip, test_knee_pops_with_planted_feet,
+               test_a_straight_leg_stays_straight,
                test_a_sunk_foot_raises_the_body_not_the_knee,
                test_heel_peel, test_pole_whip_and_follow,
                test_ballistic_flight, test_body_capsules])

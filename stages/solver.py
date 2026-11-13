@@ -585,6 +585,17 @@ def solve(rig, pins: list[s4.KinematicPin], settings: SolveSettings | None = Non
             hard = np.minimum(d_now, st.max_extension * L["length"])
             firm = L.get("by_hand", np.zeros(T)) if L["limb"].kind == "leg" else L["pin_w"]
             target = L["reach"] + firm * (np.maximum(hard, L["reach"]) - L["reach"])
+            # In a pop window a frame that is closer than its neighbours is the pop itself (on a
+            # straight leg, a one-frame dip of 8 mm bends the knee 16 degrees): bring it out to the
+            # reach around it. Soft IK below only pulls ends in, so it never touched it (QA E1).
+            # A held end (pin or plant) stays where it is held.
+            held = np.clip(np.maximum(L["pin_w"], L["planted"]), 0.0, 1.0)
+            pop_w = np.clip(L.get("soften", np.zeros(T)), 0.0, 1.0) * ik_weight * (1.0 - held)
+            if np.any(pop_w > 0.0):
+                v = L["pos"] - L["root"]
+                dd = np.linalg.norm(v, axis=1)
+                grow = np.where(dd < target, target / np.maximum(dd, 1e-9), 1.0)
+                L["pos"] = L["root"] + v * (1.0 + (grow - 1.0) * pop_w)[:, None]
             new_pos = s5.soft_ik(L["root"], L["pos"], target, weight=ik_weight)
             shift = np.linalg.norm(new_pos - L["pos"], axis=1)
             res.softik_frames += int(np.count_nonzero(shift > 1e-5 * unit))
