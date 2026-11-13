@@ -628,6 +628,154 @@ class MOCAP_OT_pin_add(_MocapOperator):
         return msg
 
 
+def _limb_end(profile, owner: str) -> str:
+    """Bone whose position stands for a pinned limb: the hand / foot, or the hips."""
+    limb = profile.limb_by_key(owner)
+    if limb is not None:
+        return limb.org_end
+    return profile.spine_bones[0] if profile.spine_bones else profile.torso_ctrl
+
+
+def _track(rig, bone: str, frames) -> np.ndarray:
+    """World matrices ``(T, 4, 4)`` of one bone over the frames."""
+    return sampler.sample_many_frames(rig, [bone], list(frames)).world_m(bone)
+
+
+def _rotations(m: np.ndarray) -> np.ndarray:
+    r = m[:, :3, :3]
+    return r / np.maximum(np.linalg.norm(r, axis=1, keepdims=True), 1e-12)
+
+
+def _angle_deg(ra: np.ndarray, rb: np.ndarray) -> np.ndarray:
+    """Angle between two stacks of rotation matrices, per frame."""
+    rel = np.einsum("tji,tjk->tik", ra, rb)
+    return np.degrees(np.arccos(np.clip((np.trace(rel, axis1=1, axis2=2) - 1.0) / 2.0, -1.0, 1.0)))
+
+
+def _frames_over(dev: np.ndarray, limit: float, first: int) -> str:
+    idx = np.nonzero(dev > limit)[0]
+    return f"{first + idx[0]}-{first + idx[-1]}" if len(idx) else ""
+
+
+def _pin_effect(scene, pin, before: np.ndarray, after: np.ndarray, a: int, b: int, lo: int) -> str:
+    """What a new pin did, measured on the limb end: how far it moved (or turned) to stay put, and where an
+    impossible hold gives way. In scene centimetres, so it matches what you measure in the viewport."""
+    cm = scene.unit_settings.scale_length * 100.0
+    holds_pos = pin.mode != "WORLD" or pin.lock_location
+    ra, rb = _rotations(before), _rotations(after)
+    moved = float(np.linalg.norm(after[:, :3, 3] - before[:, :3, 3], axis=1).max()) * cm
+    turned = float(_angle_deg(ra, rb).max())
+    k0, k1 = a - lo, b - lo + 1
+    if holds_pos:
+        text = f"moved up to {moved:.1f} cm to stay there" if moved >= 0.3 else             "it was already there (moved less than 3 mm)"
+    else:
+        text = f"turned up to {turned:.0f} deg to keep its rotation" if turned >= 0.5 else             "it already kept its rotation (turned less than half a degree)"
+    if pin.mode == "TARGET":
+        return text                                    # the target moves: the hold is not a fixed point
+    if holds_pos:
+        held = after[k0:k1, :3, 3]
+        dev = np.linalg.norm(held - held[:1], axis=1) * cm
+        if dev.max() > 1.0:
+            text += f"; gives way up to {dev.max():.1f} cm at frames {_frames_over(dev, 1.0, a)}"
+            if pin.owner != "torso":
+                text += ", where the body moves out of reach"
+    else:
+        dev = _angle_deg(rb[k0:k1], np.repeat(rb[k0:k0 + 1], k1 - k0, axis=0))
+        if dev.max() > 3.0:
+            text += f"; gives way up to {dev.max():.0f} deg at frames {_frames_over(dev, 3.0, a)}"
+    return text
+
+
+def _hold_text(pin) -> str:
+    if pin.mode == "FLOOR":
+        return "on the floor"
+    if pin.mode == "TARGET":
+        return "on " + (pin.target_object.name if pin.target_object else "its target")
+    what = [w for w, on in (("position", pin.lock_location), ("rotation", pin.lock_rotation > 0.0)) if on]
+    return "in place (" + " and ".join(what) + ")"
+
+
+class MOCAP_OT_pin_from_here(_MocapOperator):
+    bl_idname = "mocap.pin_from_here"
+    bl_label = "Pin from Here"
+    bl_description = ("Keep the chosen hand, foot or hips held from the current frame on, for the pin length "
+                      "(Release Here ends it earlier). Like iClone's pinning: tick Position and / or Rotation")
+
+    def run(self, context):
+        rig = common.require_rig(context, need_rigify=True)
+        if s6.has_residual(rig):
+            raise MocapError("The take has a residual detail layer. Merge it first (Keys stage)")
+        st = context.scene.mocap_cleanup
+        data = rig.mocap_cleanup
+        profile = common.profile_of(rig)
+        owner, mode = st.pin_limb, st.pin_hold
+        if mode == "WORLD" and not (st.pin_position or st.pin_rotation):
+            raise MocapError("Tick Position, Rotation or both: that is what the pin holds")
+        target, target_bone = None, ""
+        if mode == "TARGET":
+            others = [o for o in context.selected_objects if o != rig]
+            if not others:
+                raise MocapError("Select the object to hold on to as well (the rig has to be the active object)")
+            target = others[0]
+            if target.type == "ARMATURE" and target.data.bones.active is not None:
+                target_bone = target.data.bones.active.name
+        f0, f1 = action_io.get_action_frame_range(rig)
+        a = min(max(context.scene.frame_current, f0), f1)
+        b = min(a + st.pin_length - 1, f1)
+        lo, hi = max(f0, a - st.pin_blend_in), min(f1, b + st.pin_blend_out)
+        bone = _limb_end(profile, owner)
+        before = _track(rig, bone, range(lo, hi + 1)) if bone else None
+        with props.suspend_updates():
+            pin = data.pins.add()
+            pin.from_data(s4.KinematicPin(
+                owner=owner, mode=mode, lock_in=a, lock_out=b, blend_in=st.pin_blend_in, blend_out=st.pin_blend_out,
+                reference_frame=-1 if mode == "FLOOR" else a,
+                lock_location=st.pin_position if mode == "WORLD" else True,
+                lock_rotation=(1.0 if st.pin_rotation else 0.0) if mode == "WORLD" else 1.0,
+                name=f"{props.OWNER_LABELS[owner]} {a}-{b}"))
+            if target is not None:
+                pin.target_object = target
+                pin.target_bone = target_bone
+            data.active_pin = len(data.pins) - 1
+        label = props.OWNER_LABELS[owner]
+        msg = f"{label} held {_hold_text(pin)} on frames {a}-{b}"
+        if not st.auto_solve:
+            return msg + " - press Solve to apply it"
+        common.begin_edit(rig, upstream=False)
+        res = common.run_solve(context, rig)
+        if before is not None:
+            after = _track(rig, bone, range(lo, hi + 1))
+            msg += ": " + _pin_effect(context.scene, pin, before, after, a, b, lo)
+        # the reach is measured above; other warnings (a pin that collides with another, ...) still show
+        for w in [w for w in res.warnings if "out of reach" not in w][:1]:
+            msg += f" ({w})"
+        return msg
+
+
+class MOCAP_OT_pin_release_here(_MocapOperator):
+    bl_idname = "mocap.pin_release_here"
+    bl_label = "Release Here"
+    bl_description = ("End the hold of the chosen hand, foot or hips at the current frame (it eases back into the "
+                      "animation over Ease Out frames)")
+
+    def run(self, context):
+        rig = common.require_rig(context, need_action=False)
+        st = context.scene.mocap_cleanup
+        data = rig.mocap_cleanup
+        f = context.scene.frame_current
+        owner = st.pin_limb
+        mine = [(i, p) for i, p in enumerate(data.pins) if p.owner == owner and p.enabled and p.lock_in <= f]
+        if not mine:
+            raise MocapError(f"{props.OWNER_LABELS[owner]} has no pin that starts before this frame")
+        covering = [(i, p) for i, p in mine if p.lock_out >= f]
+        i, pin = covering[0] if covering else max(mine, key=lambda ip: ip[1].lock_in)
+        data.active_pin = i
+        pin.lock_out = max(pin.lock_in, f)                 # re-solves (Live Update)
+        if bpy.app.background:
+            autosolve.flush()
+        return f"{props.OWNER_LABELS[owner]} released at frame {pin.lock_out} (held {pin.lock_in}-{pin.lock_out})"
+
+
 class MOCAP_OT_pin_remove(_MocapOperator):
     bl_idname = "mocap.pin_remove"
     bl_label = "Remove Pin"
@@ -880,7 +1028,8 @@ CLASSES = (
     MOCAP_OT_use_active_rig, MOCAP_OT_apply_preset, MOCAP_OT_analyze, MOCAP_OT_issue_jump, MOCAP_OT_repair,
     MOCAP_OT_fill_gap, MOCAP_OT_issue_fix, MOCAP_OT_filter, MOCAP_OT_estimate_cutoff, MOCAP_OT_restore_raw,
     MOCAP_OT_snapshot, MOCAP_OT_dedrift, MOCAP_OT_level_floor, MOCAP_OT_floor_from_feet, MOCAP_OT_close_loop,
-    MOCAP_OT_detect_contacts, MOCAP_OT_pin_add, MOCAP_OT_pin_remove, MOCAP_OT_pin_clear, MOCAP_OT_pin_edge,
+    MOCAP_OT_detect_contacts, MOCAP_OT_pin_add, MOCAP_OT_pin_from_here, MOCAP_OT_pin_release_here,
+    MOCAP_OT_pin_remove, MOCAP_OT_pin_clear, MOCAP_OT_pin_edge,
     MOCAP_OT_solve, MOCAP_OT_clear_solve, MOCAP_OT_simplify, MOCAP_OT_merge_residual, MOCAP_OT_toggle_residual,
     MOCAP_OT_run_all,
 )

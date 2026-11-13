@@ -27,10 +27,16 @@ OWNER_ITEMS = (
 )
 OWNER_LABELS = {k: v for k, v, _ in OWNER_ITEMS}
 MODE_ITEMS = (
-    ("FLOOR", "Floor", "Plant on the floor: the contact point stays put, heel and toe may roll", "IMPORT", 0),
-    ("WORLD", "World", "Hold the position (and rotation) in world space", "WORLD", 1),
-    ("TARGET", "Target", "Follow another object or a bone of another character", "CON_CHILDOF", 2),
+    ("FLOOR", "On Floor", "Keep it planted on the floor where it touches it: the contact point stays put, heel and "
+     "toe may roll. A hand or foot in the air is brought down to the floor", "IMPORT", 0),
+    ("WORLD", "In Place", "Keep it where it is at the first frame of the pin, in world space (what iClone calls "
+     "pinning)", "PINNED", 1),
+    ("TARGET", "On Object", "Keep it on another object or on a bone of another character (select that object too)",
+     "CON_CHILDOF", 2),
 )
+# the pin tool offers "In Place" first: that is what "keep that hand where it is" means
+PIN_HOLD_ITEMS = tuple(next(m for m in MODE_ITEMS if m[0] == k)[:3] + ("NONE", i)   # no icons: three fit a sidebar
+                       for i, k in enumerate(("WORLD", "FLOOR", "TARGET")))
 STAGE_ITEMS = (
     ("DIAGNOSE", "1 Analyze", "1. Find flips, spikes, dropouts, jitter, sliding feet and popping knees", "VIEWZOOM", 0),
     ("FILTER", "2 Filter", "2. Remove jitter without touching clean motion", "SMOOTHCURVE", 1),
@@ -121,7 +127,7 @@ def _poll_mesh(self, obj):
 
 class MCPin(PropertyGroup):
     owner: EnumProperty(name="Limb", items=OWNER_ITEMS, update=_pin_update)
-    mode: EnumProperty(name="Mode", items=MODE_ITEMS, default="FLOOR", update=_pin_update)
+    mode: EnumProperty(name="Hold", items=MODE_ITEMS, default="FLOOR", update=_pin_update)
     lock_in: IntProperty(name="In", description="First fully locked frame", default=1, update=_pin_update)
     lock_out: IntProperty(name="Out", description="Last fully locked frame", default=10, update=_pin_update)
     blend_in: IntProperty(name="Ease In", description="Frames to blend from the animation into the lock", default=4,
@@ -132,10 +138,11 @@ class MCPin(PropertyGroup):
                                 description="Take the locked pose from one frame instead of the automatic "
                                             "(most stationary) placement")
     reference_frame: IntProperty(name="Frame", description="Frame whose pose is held", default=1, update=_pin_update)
-    lock_location: BoolProperty(name="Location", default=True, update=_pin_update)
-    lock_rotation: FloatProperty(name="Rotation", description="0: the limb end pivots freely (ball joint), "
-                                 "1: rotation is locked too", default=1.0, min=0.0, max=1.0, subtype="FACTOR",
-                                 update=_pin_update)
+    lock_location: BoolProperty(name="Position", default=True, update=_pin_update,
+                                description="Hold the position of the hand or foot (iClone: Pinning Move)")
+    lock_rotation: FloatProperty(name="Rotation", description="How much the rotation is held (iClone: Pinning Rotate). "
+                                 "0: the hand or foot turns freely, 1: its rotation is held too", default=1.0, min=0.0,
+                                 max=1.0, subtype="FACTOR", update=_pin_update)
     target_object: PointerProperty(name="Target", type=bpy.types.Object, update=_pin_update)
     target_bone: StringProperty(name="Bone", update=_pin_update)
     enabled: BoolProperty(name="Enabled", default=True, update=_pin_update)
@@ -273,6 +280,13 @@ class MCSettings(PropertyGroup):
     pin_blend_in: IntProperty(name="Ease In", default=4, min=0, max=60)
     pin_blend_out: IntProperty(name="Ease Out", default=5, min=0, max=60)
     pin_length: IntProperty(name="Length", default=20, min=1, max=10000, description="Length of a new pin in frames")
+    # the pin tool: which hand or foot, how it is held, what is held (iClone: Pinning Move / Pinning Rotate)
+    pin_limb: EnumProperty(name="Limb", items=OWNER_ITEMS, default="arm.L",
+                           description="The hand, foot or hips that Pin from Here and Release Here work on")
+    pin_hold: EnumProperty(name="Hold", items=PIN_HOLD_ITEMS, default="WORLD")
+    pin_position: BoolProperty(name="Position", default=True, description="Hold its position (iClone: Pinning Move)")
+    pin_rotation: BoolProperty(name="Rotation", default=True, description="Hold its rotation (iClone: Pinning Rotate)")
+    show_contact_settings: BoolProperty(name="Contact Detection Settings", default=False)
     use_pins: BoolProperty(name="Pins", default=True, update=_solve_setting_update)
     use_floor: BoolProperty(name="Floor Clipping", default=True, update=_solve_setting_update,
                             description="Soles, toes and wrists never dip below the floor")

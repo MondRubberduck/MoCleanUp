@@ -21,7 +21,7 @@ ISSUE_NAMES = {
     "FLIP": "Flip", "SPIKE": "Spike", "JITTER": "Jitter", "FROZEN": "Frozen", "HYPEREXT": "Over-extended",
     "KNEE_POP": "Pop", "PENETRATION": "Below floor", "SKATE": "Slide",
 }
-MODE_ICONS = {"FLOOR": "IMPORT", "WORLD": "WORLD", "TARGET": "CON_CHILDOF"}
+MODE_ICONS = {"FLOOR": "IMPORT", "WORLD": "PINNED", "TARGET": "CON_CHILDOF"}
 
 
 def _wrapped(layout, context, text: str, icon: str = "NONE") -> None:
@@ -59,15 +59,16 @@ class MOCAP_UL_issues(UIList):
 
 class MOCAP_UL_pins(UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
-        row = layout.row(align=True)
-        row.prop(item, "enabled", text="")
-        row.label(text=props.OWNER_LABELS.get(item.owner, item.owner), icon=MODE_ICONS.get(item.mode, "PINNED"))
-        sub = row.row()
-        sub.alignment = "RIGHT"
+        # checkbox | hold icon, limb and frames in one label (a list row gives each label an equal share of a
+        # narrow sidebar, which cut both short); the hold is spelled out in the details below the list
+        layout.prop(item, "enabled", text="")
         tail = ""
         if item.mode == "TARGET":
             tail = "  > " + (item.target_object.name if item.target_object else "?")
-        sub.label(text=f"{item.lock_in}-{item.lock_out}{tail}", icon="AUTO" if item.auto else "NONE")
+        elif item.mode == "WORLD" and not (item.lock_location and item.lock_rotation > 0.0):
+            tail = "  Position" if item.lock_location else "  Rotation"
+        owner = props.OWNER_LABELS.get(item.owner, item.owner)
+        layout.label(text=f"{owner}   {item.lock_in}-{item.lock_out}{tail}", icon=MODE_ICONS.get(item.mode, "PINNED"))
 
 
 def _header(layout, st, rig):
@@ -265,16 +266,13 @@ def _draw_pins(layout, context, st, rig):
     row = layout.row(align=True)
     row.scale_y = 1.2
     row.operator("mocap.detect_contacts", icon="VIEWZOOM")
-    sub = layout.row(align=True)
-    sub.label(text="Pin Here:")
-    for mode, _n, _d, icon, _v in props.MODE_ITEMS:
-        sub.operator("mocap.pin_add", text=_n, icon=icon).mode = mode
+    _pin_tool(layout, context, st, rig)
     row = layout.row()
-    row.template_list("MOCAP_UL_pins", "", data, "pins", data, "active_pin", rows=5)
+    row.template_list("MOCAP_UL_pins", "", data, "pins", data, "active_pin", rows=4)
     col = row.column(align=True)
     col.operator("mocap.pin_remove", text="", icon="REMOVE")
     col.separator()
-    col.operator("mocap.pin_clear", text="", icon="AUTO").auto_only = True
+    col.operator("mocap.pin_clear", text="", icon="VIEWZOOM").auto_only = True
     col.operator("mocap.pin_clear", text="", icon="TRASH").auto_only = False
     if 0 <= data.active_pin < len(data.pins):
         pin = data.pins[data.active_pin]
@@ -323,19 +321,67 @@ def _draw_pins(layout, context, st, rig):
     sub.prop(st, "floor_cushion", text="Cushion (s)")
     sub.prop(st, "flat_tolerance")
     _solve_row(layout, st, rig)
-    col = layout.column(align=True)
-    col.use_property_split = True
-    col.use_property_decorate = False
-    col.label(text="Detection")
-    col.prop(st, "contact_height")
-    col.prop(st, "contact_speed")
-    col.prop(st, "contact_travel")
-    col.prop(st, "pin_max_shift")
-    col.prop(st, "contact_min_time", text="Min Duration (s)")
-    col.prop(st, "contact_hands")
-    col.prop(st, "pin_blend_in")
-    col.prop(st, "pin_blend_out")
-    col.prop(st, "pin_length", text="New Pin Length")
+    if st.auto_solve:
+        note = layout.row()
+        note.scale_y = 0.8
+        note.label(text="Live Update is on: pins apply as you add or change them", icon="FILE_REFRESH")
+    box = layout.box()
+    box.prop(st, "show_contact_settings", emboss=False,
+             icon="DOWNARROW_HLT" if st.show_contact_settings else "RIGHTARROW")
+    if st.show_contact_settings:
+        col = box.column(align=True)
+        col.use_property_split = True
+        col.use_property_decorate = False
+        col.prop(st, "contact_height")
+        col.prop(st, "contact_speed")
+        col.prop(st, "contact_travel")
+        col.prop(st, "pin_max_shift")
+        col.prop(st, "contact_min_time", text="Min Duration (s)")
+        col.prop(st, "contact_hands")
+
+
+def _is_pin_result(text: str) -> bool:
+    """The result line of Pin from Here / Release Here (shown under those buttons, not at the panel's end)."""
+    head = text.split(" held ", 1)[0] if " held " in text else text.split(" released at ", 1)[0]
+    return head != text and head in props.OWNER_LABELS.values()
+
+
+def _pin_tool(layout, context, st, rig):
+    """Hold a hand, foot or the hips from the current frame on (iClone-style pinning)."""
+    box = layout.box()
+    box.label(text="Hold a Hand or Foot", icon="PINNED")
+    # Laid out like the body seen from the front: the character's right hand on the left.
+    col = box.column(align=True)
+    row = col.row(align=True)
+    for key in ("arm.R", "torso", "arm.L"):
+        row.prop_enum(st, "pin_limb", key)
+    row = col.row(align=True)
+    for key in ("leg.R", "leg.L"):
+        row.prop_enum(st, "pin_limb", key)
+    box.row(align=True).prop(st, "pin_hold", expand=True)
+    if st.pin_hold == "WORLD":
+        row = box.row(align=True)
+        row.prop(st, "pin_position", toggle=True, icon="ORIENTATION_GLOBAL")
+        row.prop(st, "pin_rotation", toggle=True, icon="ORIENTATION_GIMBAL")
+    elif st.pin_hold == "TARGET":
+        box.label(text="Select the object too (the rig active)", icon="INFO")
+    col = box.column(align=True)
+    col.prop(st, "pin_length", text="Length (frames)")
+    row = col.row(align=True)
+    row.prop(st, "pin_blend_in", text="Ease In")
+    row.prop(st, "pin_blend_out", text="Ease Out")
+    row = box.row(align=True)
+    row.scale_y = 1.3
+    row.operator("mocap.pin_from_here", icon="PINNED")
+    row.operator("mocap.pin_release_here", icon="UNPINNED")
+    f = context.scene.frame_current
+    hint = box.row()
+    hint.scale_y = 0.8
+    hint.enabled = False
+    hint.label(text=f"Pin from Here holds frames {f}-{f + st.pin_length - 1}")
+    text = common.result_for(rig)
+    if text and _is_pin_result(text):
+        _wrapped(box.box(), context, text)
 
 
 def _draw_physics(layout, context, st, rig):
@@ -440,7 +486,7 @@ class _MainPanel:
             else:
                 STAGE_DRAW[ident](box, context, st, rig)
         text = common.result_for(rig)
-        if text:
+        if text and not (st.stage == "CONTACTS" and _is_pin_result(text)):
             _wrapped(layout.box(), context, text)
         _run_all_footer(layout)
 

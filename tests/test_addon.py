@@ -168,6 +168,42 @@ def test_pipeline_through_operators():
     free = np.linalg.norm(freed.head_w("ORG-hand.R")[30:45] - freed.head_w("ORG-hand.R")[30], axis=1).max()
     assert free > 0.1 and hold < 0.5 * free, (hold, free)
 
+    # "Pin from Here" / "Release Here" (iClone-style pinning): the chosen hand holds its position from the
+    # current frame on, the result line says what the pin did, Release Here ends the hold at the current frame
+    bpy.context.scene.frame_set(f0 + 30)
+    st.pin_limb, st.pin_hold, st.pin_position, st.pin_rotation = "arm.R", "WORLD", True, False
+    assert bpy.ops.mocap.pin_from_here() == {"FINISHED"}
+    new = data.pins[data.active_pin]
+    assert (new.owner, new.mode, new.lock_in, new.lock_out, new.lock_location, new.lock_rotation) == \
+        ("arm.R", "WORLD", f0 + 30, f0 + 44, True, 0.0)
+    msg = data.last_result
+    print("   pin from here:", msg)
+    assert msg.startswith(f"Hand R held in place (position) on frames {f0 + 30}-{f0 + 44}: moved up to"), msg
+    _, held = sample_rig(rig)
+    dev = np.linalg.norm(held.head_w("ORG-hand.R")[30:45] - held.head_w("ORG-hand.R")[30], axis=1)
+    assert dev[:4].max() < 0.003
+    bpy.context.scene.frame_set(f0 + 38)
+    assert bpy.ops.mocap.pin_release_here() == {"FINISHED"} and new.lock_out == f0 + 38
+    assert data.last_result == f"Hand R released at frame {f0 + 38} (held {f0 + 30}-{f0 + 38})", data.last_result
+    assert bpy.ops.mocap.pin_remove() == {"FINISHED"} and len(data.pins) == n - 1
+    # an In Place pin with neither Position nor Rotation ticked would hold nothing
+    st.pin_position = st.pin_rotation = False
+    try:
+        bpy.ops.mocap.pin_from_here()
+        raise AssertionError("an In Place pin that holds nothing must be refused")
+    except RuntimeError as exc:
+        assert "Position" in str(exc)
+    st.pin_position = st.pin_rotation = True
+    # a limb without a pin before this frame cannot be released
+    st.pin_limb = "arm.L"
+    bpy.context.scene.frame_set(f0 + 1)
+    if not any(p.owner == "arm.L" and p.lock_in <= f0 + 1 for p in data.pins):
+        try:
+            bpy.ops.mocap.pin_release_here()
+            raise AssertionError("Release Here without a pin must be refused")
+        except RuntimeError as exc:
+            assert "no pin" in str(exc)
+
     # HUD data for the current frame
     bpy.context.scene.frame_set(gt["plants"]["L"][1][0] + 4)
     hud = draw.hud_state(bpy.context, rig)

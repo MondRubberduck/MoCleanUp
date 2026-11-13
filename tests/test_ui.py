@@ -109,7 +109,8 @@ def test_every_panel_layout():
         "DIAGNOSE": {"mocap.analyze", "mocap.issue_jump", "mocap.issue_fix", "mocap.repair", "mocap.fill_gap"},
         "FILTER": {"mocap.filter", "mocap.estimate_cutoff", "mocap.restore_raw", "mocap.snapshot"},
         "DRIFT": {"mocap.dedrift", "mocap.level_floor", "mocap.close_loop", "mocap.floor_from_feet"},
-        "CONTACTS": {"mocap.detect_contacts", "mocap.pin_add", "mocap.pin_remove", "mocap.pin_clear", "mocap.pin_edge",
+        "CONTACTS": {"mocap.detect_contacts", "mocap.pin_from_here", "mocap.pin_release_here", "mocap.pin_remove",
+                     "mocap.pin_clear", "mocap.pin_edge",
                      "mocap.solve", "mocap.clear_solve"},
         "PHYSICS": {"mocap.solve", "mocap.clear_solve"},
         "SIMPLIFY": {"mocap.simplify", "mocap.restore_raw"},
@@ -128,7 +129,8 @@ def test_every_panel_layout():
             assert stats["rows"] == len(data.issues)
         if stage == "CONTACTS":
             assert stats["rows"] == len(data.pins)
-            assert {"lock_in", "blend_out", "floor_z", "floor_auto", "floor_object", "use_floor"} <= stats["props"]
+            assert {"lock_in", "blend_out", "floor_z", "floor_auto", "floor_object", "use_floor", "pin_limb", "pin_hold",
+                    "pin_position", "pin_rotation", "pin_length", "show_contact_settings"} <= stats["props"]
     # a pin that follows another object shows its target fields
     with props.suspend_updates():
         pin = data.pins[0]

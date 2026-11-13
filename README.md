@@ -22,7 +22,7 @@ To build the zip yourself: `blender -c extension build --source-dir . --output-d
    the largest change it made to the body ("Largest change: Knee R 4.1 cm at frame 40"), so you know
    where to look.
 4. Walk through what is left with `[` and `]`. Each issue has a **Fix This Issue** button.
-5. Adjust: drag pins in the Dope Sheet, add pins with **Pin Here**, change a setting. With
+5. Adjust: drag pins in the Dope Sheet, add pins with **Pin from Here**, change a setting. With
    *Live Update* on, the result follows.
 
 Nothing is lost on the way. The first edit stores a hidden copy of the take; **Restore Raw** brings
@@ -44,14 +44,20 @@ back the whole take, a frame range, or only the selected bones.
 A pin holds a foot, a hand or the hips for a span of frames and blends back to the animation on
 either side.
 
-* **Floor** plants the foot: the contact point stays where it is, heel and ball may still roll.
-* **World** holds position (and, by the *Rotation* amount, orientation) in space.
-* **Target** follows another object or a bone of another character, with the offset it has at the
+* **In Place** holds it where it is at the first frame of the pin, in world space. Tick **Position**,
+  **Rotation** or both (iClone calls these Pinning Move and Pinning Rotate): with only Rotation the
+  hand keeps its angle while the arm carries it along.
+* **On Floor** plants it: the contact point stays where it touches the floor, heel and ball may still
+  roll. A hand or foot in the air is brought down to the floor.
+* **On Object** follows another object or a bone of another character, with the offset it has at the
   reference frame. Pin one dancer's hand to the other dancer's shoulder this way.
 
-Select a control (`foot_ik.L`, `hand_ik.R`, `torso`, or any bone of that limb), go to the first frame of
-the contact and press **Pin Here**. **Detect Contacts** creates floor pins for every foot plant it
-finds. A foot that travels is not planted: a contact ends where the grounded part of the foot moves
+To pin by hand: under **Hold a Hand or Foot** pick the limb and what to hold, go to the first frame and
+press **Pin from Here**; it holds for *Length* frames. Go to the last frame and press **Release Here**
+to end it there (earlier or later). The line under the buttons says what the pin did, measured on the
+hand or foot: "Hand L held in place on frames 300-329: moved up to 43.4 cm to stay there; gives way up
+to 9.6 cm at frames 304-329, where the body moves out of reach", or that it was already there.
+**Detect Contacts** creates floor pins for every foot plant it finds. A foot that travels is not planted: a contact ends where the grounded part of the foot moves
 more than *Max Travel* (3 cm), so slow sliding steps stay steps. A detected pin moves a foot at most
 *Max Correction* (5 cm) along the floor and says where it gave way; pins made by hand hold whatever it takes. Pins appear as bars in the Dope Sheet: drag the body to move a pin, an edge to change the
 locked span, a ramp to change the ease. An arm that is animated in FK is switched to IK inside the
