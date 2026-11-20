@@ -191,6 +191,14 @@ def pivot_motion(points: np.ndarray, floor: Floor, fps: float, tau_h: float, tau
     of the pivot and its path along the floor. The path is integrated from the velocity, so it does
     not jump when the pivot changes from heel to ball.
     """
+    w, h, speed = pivot_weights(points, floor, fps, tau_h, tau_v)
+    pv = np.sum(w[..., None] * windowed_velocity(points, fps), axis=1)
+    return h.min(axis=1), np.sum(w * speed, axis=1), np.cumsum(pv[:, :2], axis=0) / fps
+
+
+def pivot_weights(points: np.ndarray, floor: Floor, fps: float, tau_h: float, tau_v: float):
+    """How much each sole point ``(T, K)`` is what the foot stands on: low, and holding still (``pivot_motion``).
+    Returns ``(weights (T, K), height above the floor (T, K), speed (T, K))``."""
     h = points[..., 2] - floor.height(points)
     vel = windowed_velocity(points, fps)
     # Holding still: before this frame or after it. (A difference across the frame would count the
@@ -207,8 +215,12 @@ def pivot_motion(points: np.ndarray, floor: Floor, fps: float, tau_h: float, tau
     w = (np.exp(-(h - h.min(axis=1, keepdims=True)) / max(tau_h, 1e-9))
          * np.exp(-(speed - speed.min(axis=1, keepdims=True)) / max(tau_v, 1e-9)))
     w /= w.sum(axis=1, keepdims=True)
-    pv = np.sum(w[..., None] * vel, axis=1)
-    return h.min(axis=1), np.sum(w * speed, axis=1), np.cumsum(pv[:, :2], axis=0) / fps
+    return w, h, speed
+
+
+def pivot_tolerances(height_tol: float, speed_tol: float) -> tuple[float, float]:
+    """``(tau_h, tau_v)`` of ``pivot_motion`` for the tolerances of the contact detector."""
+    return 0.125 * height_tol, 0.2 * speed_tol
 
 
 def contact_probability(points: np.ndarray, floor: Floor, fps: float, height_tol: float, speed_tol: float,
@@ -221,7 +233,7 @@ def contact_probability(points: np.ndarray, floor: Floor, fps: float, height_tol
     With the thresholds of ``hysteresis_runs`` a contact starts below about 0.8 of ``speed_tol``
     and ends above it.
     """
-    h_min, speed, slip = pivot_motion(points, floor, fps, 0.125 * height_tol, 0.2 * speed_tol)
+    h_min, speed, slip = pivot_motion(points, floor, fps, *pivot_tolerances(height_tol, speed_tol))
     s_h = np.exp(-((np.maximum(h_min, 0.0) / max(height_tol, 1e-9)) ** 2))
     s_v = np.exp(-((speed / max(speed_tol, 1e-9)) ** 2))
     prob = s_h * s_v

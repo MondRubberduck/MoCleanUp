@@ -24,7 +24,7 @@ import bpy
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
 
-from ..core import action_io, sampler
+from ..core import action_io, raw_snapshot, sampler
 from ..core.dsp import close_small_gaps, find_runs, whittaker_lambda_for_cutoff, whittaker_smooth
 from ..core.math_quat import (
     quat_angle_between,
@@ -209,6 +209,13 @@ def _leave_out_margin(x: np.ndarray, s: int, en: int, noise: float, reach: int =
     return dev / max(fit, noise, 1e-300)
 
 
+def noise_level(x: np.ndarray) -> float:
+    """The typical 4th difference of a vector signal ``(T, D)``: the clip's own level (``outlier_scores``)."""
+    e = fourth_difference(np.asarray(x, dtype=np.float64).reshape(len(x), -1))
+    inner = e[2:-2] if len(e) > 8 else e
+    return float(np.median(inner)) if len(inner) else 0.0
+
+
 def outlier_scores(x: np.ndarray, floor: float, spike_z: float = 6.5, max_spike_len: int = 4,
                    protect: np.ndarray | None = None, dynamics: float = 0.1):
     """Spike mask and noise scores of a vector signal ``(T, D)``.
@@ -226,7 +233,8 @@ def outlier_scores(x: np.ndarray, floor: float, spike_z: float = 6.5, max_spike_
     * ``z_sustained``: running median of ``e`` - bursts of jitter, blind to single events
 
     ``protect`` marks frames owned by other detectors (dropouts). Returns
-    ``(spike_mask (T,), z (T,), z_sustained (T,), sigma)``.
+    ``(spike_mask (T,), z (T,), z_sustained (T,), sigma, scale (T,))``: ``scale`` is what the scores are
+    measured against on each frame.
     """
     x = np.asarray(x, dtype=np.float64).reshape(len(x), -1)
     e = fourth_difference(x)
@@ -265,7 +273,7 @@ def outlier_scores(x: np.ndarray, floor: float, spike_z: float = 6.5, max_spike_
         spike[s : en + 1] = True
     z = np.maximum(e, np.where(spike, h, 0.0)) / scale
     z_sustained = running_median(np.where(_dilate(spike, 2), 0.0, e), 3) / scale
-    return spike, z, z_sustained, sigma
+    return spike, z, z_sustained, sigma, scale
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +403,7 @@ def analyze(rig, *, bone_names: list[str] | None = None, floor_z: float = 0.0, f
 
     # ---- pass 1: read everything, find dropouts (they own their frames) -----------------------------
     chans = {b: action_io.read_bone_local_channels(rig, b, f0, f1) for b in animated}
+    captured = raw_snapshot.get_raw_snapshot(rig)                  # the take before anything was done to it
     body_change = np.zeros(T - 1)
     for ch in chans.values():
         if ch["has_rot"]:
@@ -458,13 +467,14 @@ def analyze(rig, *, bone_names: list[str] | None = None, floor_z: float = 0.0, f
 
         # ---- spikes / jitter ----------------------------------------------------------------------
         z_all = np.zeros(T)
+        was = action_io.read_bone_local_channels(rig, bone, f0, f1, action=captured) if captured is not None else None
         for key, has, floor_v in (("loc", ch["has_loc"], loc_floor), ("rot", ch["has_rot"], rot_floor)):
             if not has:
                 continue
             x = ch["loc"] if key == "loc" else rotation_tangent_curve(ch["quat"])
             if key == "loc" and np.ptp(x, axis=0).max() > 1e-4 * unit / scale and len(cutoff_cols) < 60:
                 cutoff_cols.append(x * scale)
-            spike, z, z_sus, sigma = outlier_scores(x, floor_v, spike_z, protect=protect)
+            spike, z, z_sus, sigma, level = outlier_scores(x, floor_v, spike_z, protect=protect)
             # (the 4th difference of unit white noise has a median norm of ~2.14 sigma for 3 columns)
             if key == "loc":
                 loc_rms = sigma * scale / 2.14 if sigma > floor_v else 0.0
@@ -488,12 +498,22 @@ def analyze(rig, *, bone_names: list[str] | None = None, floor_z: float = 0.0, f
                 add_runs(spike, "SPIKE", bone,
                          lambda s, e, zz=z, ok=sure: (0.6 + 0.4 * min(1.0, zz[s:e + 1].max() / (4 * spike_z))) * (1.0 if ok[s:e + 1].all() else 0.6),
                          msg, part=key)
-            burst = (z_sus >= jitter_z) & ~spike
+            # Jitter is listed by the standard of the take as it was captured. A filtered take measured against
+            # itself can never come out clean: its own level has dropped with the noise, and whatever is left
+            # stands out against that for ever (141 "jitter" left on a real take after one click, none of them
+            # anything the raw take would have been blamed for). The confidence above keeps the clip's own level:
+            # that is what the adaptive filter works with.
+            against, heard = "the clip level", z_sus
+            if was is not None and was["has_" + key]:
+                before = noise_level(was["loc"] if key == "loc" else rotation_tangent_curve(was["quat"]))
+                if before > sigma:
+                    against, heard = "the level of the raw take", z_sus * level / np.maximum(level, before)
+            burst = (heard >= jitter_z) & ~spike
             if burst.any():
                 label = "location" if key == "loc" else "rotation"
                 add_runs(burst, "JITTER", bone,
-                         lambda s, e, zz=z_sus: 0.3 + 0.4 * min(1.0, zz[s:e + 1].max() / 6.0),
-                         lambda s, e, zz=z_sus, lb=label: f"{bone}: {lb} noise {zz[s:e + 1].max():.1f}x above the clip level",
+                         lambda s, e, zz=heard: 0.3 + 0.4 * min(1.0, zz[s:e + 1].max() / 6.0),
+                         lambda s, e, zz=heard, lb=label, lv=against: f"{bone}: {lb} noise {zz[s:e + 1].max():.1f}x above {lv}",
                          min_len=5, gap=2, part=key)
         conf = np.exp(-0.35 * np.maximum(z_all - 2.5, 0.0))
         conf[sure_any] = 0.02                  # the filter ignores these frames; a doubtful spike stays data
@@ -644,9 +664,11 @@ def _world_checks(rig, profile, report, f0, f1, fps, floor_z, floor_object, hype
                 d = float(depth[s : e + 1].max())
                 issues.append(Issue("PENETRATION", f0 + s, f0 + e, leg.ik_ctrl, float(np.clip(0.4 + d / (0.1 * unit), 0.4, 1.0)),
                                     f"{name} {d / unit * 100:.1f} cm below the floor"))
-            h = pts[..., 2] - floor.height(pts)
-            w = np.exp(-(h - h.min(axis=1, keepdims=True)) / (0.0015 * unit))
-            w /= w.sum(axis=1, keepdims=True)
+            # What slides is what the foot stands on: the part of the sole that is low and holding still, as the
+            # contact detector and the pins see it. (By height alone a foot that turns on its heel or its ball
+            # read as a slide - "slides 11.7 cm while planted" for a pivot that moved 1.3 cm, and after a cleanup
+            # four of the five entries left on a real take were such pivots.)
+            w = s4.pivot_weights(pts, floor, fps, *s4.pivot_tolerances(0.04 * unit, 0.15 * unit))[0]
             vel = np.gradient(pts, axis=0)
             pivot_v = np.sum(w[..., None] * vel, axis=1)
             pivot_v[:, 2] = 0.0
