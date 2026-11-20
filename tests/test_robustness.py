@@ -22,7 +22,7 @@ from mocap_cleanup.core.rig_inspector import commanded_end
 from mocap_cleanup.stages import solver
 from mocap_cleanup.stages import stage1_diagnostics as s1
 from mocap_cleanup.stages import stage4_contacts_pins as s4
-from mocap_cleanup.ui import operators
+from mocap_cleanup.ui import autosolve, operators
 
 SOLE = np.array([[-0.045, 0.06, 0.0], [0.045, 0.06, 0.0], [-0.05, -0.16, 0.0], [0.05, -0.16, 0.0]])   # heel, heel, ball, ball
 
@@ -830,6 +830,66 @@ def test_the_fk_chain_follows_the_cleanup():
     assert action_io.action_checksum(rig) == crc
 
 
+def test_solves_do_not_stack_when_both_chains_are_keyed():
+    """A Rig Bridge take has arms in FK with the IK hand control keyed along. After a solve the chain sync keys
+    that IK control again - a channel of the solve layer. That is part of the result, not a hand edit of it:
+    the next solve still starts from the take as it was, and Remove Solve gives it back (sanity check before
+    1.3.1: the solved state had become the new base, so re-solves stacked and Remove Solve returned the first
+    solve instead of the take)."""
+    from mocap_cleanup.core import chain_sync, raw_snapshot
+    from mocap_cleanup.core.rig_inspector import inspect_rig
+    from mocap_cleanup.stages import solver
+    rig, gt, st = ta.make_scene()
+    for pb in rig.pose.bones:
+        pb.ik_stretch = 0.0
+    set_limb_props(rig, ik_stretch=0.0, pole_vector=True, ik_fk_arms=1.0)      # arms in FK on every frame
+    gt = synth_walk(rig, n_frames=gt["T"], stride=0.6, drop=0.12)
+    corrupt_feet(rig, gt)                                                       # feet sink: the solve raises the body
+    profile = inspect_rig(rig)
+    f0, f1, T = gt["f0"], gt["f1"], gt["T"]
+    ident = np.tile([1.0, 0.0, 0.0, 0.0], (T, 1))
+    for limb in profile.limbs():
+        for fk, _org in chain_sync.fk_chain(rig, limb):
+            action_io.write_bone_local_channels(rig, fk, f0, quat=ident)
+    snap = raw_snapshot.ensure_raw_snapshot(rig)
+    snap[chain_sync.SYNC_KEY] = ",".join(l.key for l in profile.limbs())
+    assert chain_sync.sync(rig, profile), "nothing was written"                  # legs: FK follows; arms: IK follows
+    assert raw_snapshot.delete_raw_snapshot(rig)
+    paths = solver.solver_channel_paths(rig, profile)
+
+    def layer(action=None):
+        return {(fc.data_path, fc.array_index): action_io.sample_fcurve_range(fc, f0, f1)
+                for fc in action_io.iter_fcurves(rig, action) if fc.data_path in set(paths)}
+
+    def same(a, b):
+        return set(a) == set(b) and all(np.array_equal(a[k], b[k]) for k in a)
+
+    take = layer()
+    hand0 = action_io.read_bone_local_channels(rig, "hand_ik.L", f0, f1)["loc"].copy()
+    assert bpy.ops.mocap.detect_contacts() == {"FINISHED"}                      # Live Update: solves
+    data = rig.mocap_cleanup
+    assert chain_sync.came_in_sync(rig) >= {"arm.L", "arm.R", "leg.L", "leg.R"}, chain_sync.came_in_sync(rig)
+    # hold the hips for a moment: the body (and the FK arms on it) moves, the IK hand controls have to follow
+    bpy.context.scene.frame_set(f0 + 30)
+    st.pin_limb, st.pin_hold, st.pin_position, st.pin_rotation, st.pin_length = "torso", "WORLD", True, True, 15
+    assert bpy.ops.mocap.pin_from_here() == {"FINISHED"}
+    moved = float(np.abs(action_io.read_bone_local_channels(rig, "hand_ik.L", f0, f1)["loc"] - hand0).max())
+    assert moved > 0.002, moved                 # the fixture: the sync did key the IK hand control after the solve
+    assert raw_snapshot.solve_is_intact(rig, paths)
+    assert same(layer(raw_snapshot.get_solve_base(rig)), take)
+    for _ in range(2):                                                          # two more solves: a pin is edited
+        pin = next(p for p in data.pins if p.owner == "leg.L" and p.lock_out - p.lock_in > 10)
+        pin.lock_out -= 2
+        assert autosolve.flush() == 1
+        assert same(layer(raw_snapshot.get_solve_base(rig)), take), "the solved state became the base"
+        assert raw_snapshot.solve_is_intact(rig, paths)
+    assert bpy.ops.mocap.clear_solve() == {"FINISHED"}
+    back = layer()
+    worst = max(float(np.abs(back[k] - take[k]).max()) for k in take if not k[0].startswith('pose.bones["hand_ik')
+                and "upper_arm_ik_target" not in k[0])
+    assert set(back) == set(take) and worst == 0.0, worst                       # the take as it was before the solve
+
+
 def test_unexpected_errors_are_reported_not_swallowed():
     rig, gt, st = ta.make_scene(n_frames=70)
     original = operators.common.run_analyze
@@ -869,4 +929,5 @@ if __name__ == "__main__":
                test_a_leg_switched_to_ik_takes_its_toes_along, test_a_slow_step_is_not_a_plant,
                test_a_contact_is_cut_where_the_foot_travels, test_a_detected_pin_gives_way,
                test_a_planted_foot_turns_on_its_ball, test_the_fk_chain_follows_the_cleanup,
+               test_solves_do_not_stack_when_both_chains_are_keyed,
                test_unexpected_errors_are_reported_not_swallowed])

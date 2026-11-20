@@ -126,10 +126,22 @@ def remember_chains(rig) -> None:
 
 
 def sync_chains(rig) -> list[str]:
-    """After an edit: the FK chains of those limbs follow the result. Never fails an edit that is done."""
+    """After an edit: the FK chains of those limbs follow the result. Never fails an edit that is done.
+
+    Where a limb is in FK the sync keys its IK control and pole instead - channels of the solve layer. That is
+    part of the solve's result, not a hand edit of it: the solve stays marked as intact. (Otherwise the next
+    solve took the solved curves for the user's and made them its base: re-solves stacked on a Rig Bridge take,
+    and Remove Solve gave back the first solve instead of the take.)"""
     try:
         profile = profile_of(rig)
-        return chain_sync.sync(rig, profile) if profile.kind == "RIGIFY" else []
+        if profile.kind != "RIGIFY":
+            return []
+        paths = solver.solver_channel_paths(rig, profile)
+        intact = raw_snapshot.solve_is_intact(rig, paths)
+        written = chain_sync.sync(rig, profile)
+        if intact and written:
+            raw_snapshot.mark_solved(rig, paths)
+        return written
     except Exception as exc:
         print(f"MoCap Cleanup: could not re-sync the FK chains ({exc})")
         return []
