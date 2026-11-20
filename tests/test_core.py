@@ -354,6 +354,21 @@ def test_kept_samples():
     assert how == "full", how
     is_fresh(smp)
     assert kept()[1:] == ("cached", 0)
+    # something of the rig is changed that is no curve (a constraint): the frame that is evaluated as a check on
+    # every call finds the sample out of date, and the take is sampled again
+    con = rig.pose.bones["foot_ik.L"].constraints.new("LIMIT_LOCATION")
+    con.owner_space = "LOCAL"
+    con.use_min_x = con.use_max_x = True
+    con.min_x = con.max_x = 0.3
+    smp, how, n = kept()
+    assert how == "full", how
+    is_fresh(smp)
+    assert kept()[1:] == ("cached", 0)                   # (out of date once is not a rig that cannot be sampled by frame)
+    rig.pose.bones["foot_ik.L"].constraints.remove(con)
+    smp, how, n = kept()
+    assert how == "full", how
+    is_fresh(smp)
+    assert kept()[1:] == ("cached", 0)
     # another frame range is another sample
     smp, how, n = kept(f0, f1 - 10)
     assert how == "full" and smp.T == T - 10, (how, smp.T)

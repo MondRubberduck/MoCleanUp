@@ -69,11 +69,13 @@ _trusted: set[frozenset] = set()     # object sets whose isolated evaluation mat
 _scene_bound: set[frozenset] = set() # object sets that only evaluate correctly inside their scene
 _probe = 0
 _kept: dict[tuple, dict] = {}        # (reuse name, object names) -> the sample kept under that name
-_no_reuse: set[tuple] = set()        # ... for which updating single frames did not reproduce the kept sample
+_no_reuse: set[tuple] = set()        # ... whose rig cannot be sampled frame by frame (see ``_update_frames``)
+_failed: set[tuple] = set()          # ... whose check failed on the last call
 KEEP_SETS = 3                        # characters whose samples are kept at the same time
 
 
 def reset_cache() -> None:
+    _failed.clear()
     _trusted.clear()
     _scene_bound.clear()
     _kept.clear()
@@ -401,8 +403,10 @@ def sample_objects(requests: list[tuple[object, list[str] | None]], f0: int, f1:
     ``reuse``: a name for this caller's sample. Evaluating a control rig is what takes the time (7 s for a
     3-minute take), and after a small edit almost every frame is as it was. The sample taken under this name
     is kept, and the next call evaluates only the frames whose curves are not what they were when that frame
-    was sampled (``CurveState``), plus one that did not change, as a check. The samples returned are then the kept ones, updated in place: do not hold
-    on to them across calls. ``last_reuse`` / ``last_frames`` say what had to be evaluated.
+    was sampled (``CurveState``), plus one that did not change, as a check: a constraint that was changed or a
+    bone that was moved in edit mode changes no curve. The samples returned are then the kept ones, updated in
+    place: do not hold on to them across calls. ``last_reuse`` / ``last_frames`` say what had to be evaluated
+    (the check frame not counted).
     """
     global last_reuse, last_frames
     scene = scene or bpy.context.scene
@@ -424,14 +428,12 @@ def sample_objects(requests: list[tuple[object, list[str] | None]], f0: int, f1:
         for name, state in now.items():
             changed |= state.changed_since(kept["curves"][name])
         n = int(changed.sum())
-        if n == 0:
-            last_reuse, last_frames = "cached", 0
-            return kept["samples"]
         if n <= 0.5 * T and _update_frames(kept, requests, f0, np.flatnonzero(changed), ~changed, scene, isolate):
             idx = np.flatnonzero(changed)
             for name, state in now.items():                   # frames left alone keep what they were sampled at
                 kept["curves"][name] = kept["curves"][name].take(state, idx)
-            last_reuse, last_frames = "partial", n
+            _failed.discard(key)
+            last_reuse, last_frames = ("partial", n) if n else ("cached", 0)
             return kept["samples"]
     samples = _sample_full(requests, f0, f1, scene, hide_other_meshes, isolate)
     _kept.pop(key, None)                                      # (newest last)
@@ -445,8 +447,11 @@ def sample_objects(requests: list[tuple[object, list[str] | None]], f0: int, f1:
 
 
 def _update_frames(kept: dict, requests, f0: int, idx: np.ndarray, same: np.ndarray, scene, isolate: bool) -> bool:
-    """Evaluate the frames ``idx`` again and put them into the kept sample. False if a frame that should be as
-    it was is not (a rig whose pose depends on other frames): then the whole take has to be sampled."""
+    """Evaluate the frames ``idx`` again and put them into the kept sample, and one of the others as a check.
+    False if that one is not what it was: then the whole take has to be sampled. Once, that means the sample
+    is out of date (something of the rig was changed that is no curve). Twice in a row - on a sample that had
+    just been taken - it means the pose depends on more than the frame (physics, a simulation): such a rig is
+    sampled whole from then on."""
     global _probe
     check = np.flatnonzero(same)
     probe = None
@@ -470,8 +475,11 @@ def _update_frames(kept: dict, requests, f0: int, idx: np.ndarray, same: np.ndar
             smp = samples[obj.name]
             for new, old in ((ow[-1], smp.obj_world[probe]), (pose[-1], smp.pose[probe])):
                 if new.size and np.abs(new - old).max() > 1e-4 * max(1.0, float(np.abs(new).max())):
-                    _no_reuse.add(next(k for k, v in _kept.items() if v is kept))
-                    print(f"MoCap Cleanup: the pose of {obj.name!r} depends on other frames; sampling the whole take")
+                    key = next(k for k, v in _kept.items() if v is kept)
+                    if key in _failed:
+                        _no_reuse.add(key)
+                        print(f"MoCap Cleanup: the pose of {obj.name!r} depends on other frames; sampling the whole take")
+                    _failed.add(key)
                     return False
         idx = idx[:-1]
     n = len(idx)
