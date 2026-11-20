@@ -22,7 +22,7 @@ import bpy
 import numpy as np
 
 from . import action_io, raw_snapshot, sampler
-from .math_quat import quat_angle_between, quat_from_matrix, quat_hemisphere_continuous
+from .math_quat import quat_angle_between
 
 SYNC_KEY = "mocap_cleanup_chains_in_sync"
 AGREE = 0.005              # metres for a 1.75 m character: chains closer than this are copies of each other
@@ -149,7 +149,8 @@ def sync(rig, profile, f0: int | None = None, f1: int | None = None) -> list[str
                 b = b.parent
     written: list[str] = []
     if limbs:
-        smp = sampler.sample_objects([(rig, names)], f0, f1)[rig.name]
+        # (the samples are kept: after a pin edit only the frames the solve changed are evaluated again)
+        smp = sampler.sample_objects([(rig, names)], f0, f1, reuse="chains.fk")[rig.name]
         for limb in limbs:
             active = _switch(rig, limb, f0, f1) < 1e-4
             if not active.any():
@@ -196,12 +197,8 @@ def sync(rig, profile, f0: int | None = None, f1: int | None = None) -> list[str
                 have = action_io.read_bone_local_channels(rig, fk, f0, f1)["quat"]
                 if float(quat_angle_between(quat, have)[active].max()) <= 1e-5:
                     continue
-                # one curve without sign flips: continuous in itself, on the side of what is there
-                ref = quat_hemisphere_continuous(have)[0]
-                quat = quat_hemisphere_continuous(np.where(active[:, None], quat, ref))[0]
-                if float(np.sum(quat * ref)) < 0.0:
-                    quat = -quat
-                action_io.write_bone_local_channels(rig, fk, f0, quat=quat)
+                # (only where IK is active: the other keys stay what they are, to the last bit)
+                action_io.write_bone_local_channels(rig, fk, f0, quat=quat, only=active)
                 changed = True
             if changed:
                 written.append(limb.label)
@@ -214,18 +211,12 @@ def sync(rig, profile, f0: int | None = None, f1: int | None = None) -> list[str
 
 
 def _write_pose(rig, bone: str, f0: int, P_new: np.ndarray, P_par, mask: np.ndarray, loc_only: bool = False) -> bool:
-    """Key ``bone`` to the pose matrices ``P_new`` on the frames of ``mask`` (other frames as they are)."""
+    """Key ``bone`` to the pose matrices ``P_new`` on the frames of ``mask``. The keys of the other frames stay
+    exactly as they are. (Writing the whole curve changed thousands of keys by a rounding error, and the sign
+    of every key behind a hemisphere flip of the take: the same rotations, but keys on frames the sync has no
+    business with - and the next solve had to evaluate the whole take again.)"""
     loc, quat = sampler.pose_to_basis(rig, bone, P_new, P_par)
-    have = action_io.read_bone_local_channels(rig, bone, f0, f0 + len(P_new) - 1)
-    loc = np.where(mask[:, None], loc, have["loc"])
-    if loc_only:
-        action_io.write_bone_local_channels(rig, bone, f0, loc=loc)
-        return True
-    ref = quat_hemisphere_continuous(have["quat"])[0]
-    quat = quat_hemisphere_continuous(np.where(mask[:, None], quat, ref))[0]
-    if float(np.sum(quat * ref)) < 0.0:
-        quat = -quat
-    action_io.write_bone_local_channels(rig, bone, f0, loc=loc, quat=quat)
+    action_io.write_bone_local_channels(rig, bone, f0, loc=loc, quat=None if loc_only else quat, only=mask)
     return True
 
 
@@ -244,7 +235,7 @@ def _ik_follows_fk(rig, profile, items, f0: int, f1: int) -> list[str]:
         par = bones[limb.ik_ctrl].parent
         if par is not None:
             names.add(par.name)
-    smp = sampler.sample_objects([(rig, sorted(names))], f0, f1)[rig.name]
+    smp = sampler.sample_objects([(rig, sorted(names))], f0, f1, reuse="chains.ik")[rig.name]
     scale = float(np.linalg.norm(smp.obj_world[0][:3, 0]))
     done = []
     for limb, fk_on in items:
@@ -269,7 +260,7 @@ def _ik_follows_fk(rig, profile, items, f0: int, f1: int) -> list[str]:
             pp = bones[limb.pole_ctrl].parent
             if pp is not None:
                 pnames.add(pp.name)
-    smp2 = sampler.sample_objects([(rig, sorted(pnames))], f0, f1)[rig.name] if pnames else None
+    smp2 = sampler.sample_objects([(rig, sorted(pnames))], f0, f1, reuse="chains.poles")[rig.name] if pnames else None
     for limb, fk_on in done:
         pole = limb.pole_ctrl
         if smp2 is None or not pole or pole not in bones:

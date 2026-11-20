@@ -295,52 +295,68 @@ def read_bone_local_channels(obj, bone_name: str, frame_start: int, frame_end: i
 
 
 def write_bone_local_channels(obj, bone_name: str, frame_start: int, loc=None, quat=None, action=None,
-                              interpolation: str = "LINEAR", enforce_continuity: bool = True):
-    """Write dense location ``(T, 3)`` and / or rotation ``(T, 4)`` curves in the bone's rotation mode."""
+                              interpolation: str = "LINEAR", enforce_continuity: bool = True, only=None):
+    """Write dense location ``(T, 3)`` and / or rotation ``(T, 4)`` curves in the bone's rotation mode.
+
+    ``only``: the frames ``(T,)`` to write. On the others the keys stay exactly what they are (what is passed
+    for them is not looked at). A rotation then takes the sign (the Euler turn) of what is keyed on its own
+    frame instead of being made continuous along the curve, so that no key outside ``only`` has to change.
+    """
     pb = obj.pose.bones.get(bone_name)
     if pb is None:
         raise KeyError(f"PoseBone '{bone_name}' not found on '{obj.name}'")
     cb = ensure_channelbag(obj, action)
     rot_mode = pb.rotation_mode
+    keep = None if only is None else ~np.asarray(only, dtype=bool)
+
+    def stored(path, defaults, n):
+        return np.stack([sample_fcurve_range(find_fcurve(cb, path, i), frame_start, frame_start + n - 1, default_val=float(d))
+                         for i, d in enumerate(defaults)], axis=1)
+
+    def put(path, values, defaults):
+        if keep is not None:
+            values = np.where(keep[:, None], stored(path, defaults, len(values)), values)
+        for i in range(values.shape[1]):
+            write_fcurve_range(cb, path, i, frame_start, values[:, i], group_name=bone_name, interpolation=interpolation)
 
     if loc is not None:
-        loc = np.asarray(loc, dtype=np.float64)
-        path = bone_data_path(bone_name, "location")
-        for i in range(3):
-            write_fcurve_range(cb, path, i, frame_start, loc[:, i], group_name=bone_name, interpolation=interpolation)
+        put(bone_data_path(bone_name, "location"), np.asarray(loc, dtype=np.float64), tuple(pb.location))
 
     if quat is None:
         return
     quat = np.array(quat, dtype=np.float64, copy=True)
     T = len(quat)
-    if enforce_continuity and T > 1:
+    if enforce_continuity and T > 1 and keep is None:
         dots = np.sum(quat[:-1] * quat[1:], axis=1)
         sign = np.where(np.cumsum(np.concatenate([[False], dots < 0.0])) % 2 == 1, -1.0, 1.0)
         quat *= sign[:, None]
 
     if rot_mode == "QUATERNION":
         path = bone_data_path(bone_name, "rotation_quaternion")
-        for i in range(4):
-            write_fcurve_range(cb, path, i, frame_start, quat[:, i], group_name=bone_name, interpolation=interpolation)
+        if keep is not None:
+            have = stored(path, tuple(pb.rotation_quaternion), T)
+            quat = np.where(np.sum(quat * have, axis=1, keepdims=True) < 0.0, -quat, quat)
+        put(path, quat, tuple(pb.rotation_quaternion))
     elif rot_mode == "AXIS_ANGLE":
         path = bone_data_path(bone_name, "rotation_axis_angle")
         aa = np.empty((T, 4), dtype=np.float64)
         for t in range(T):
             axis, angle = Quaternion(quat[t]).to_axis_angle()
             aa[t] = (angle, axis.x, axis.y, axis.z)
-        for i in range(4):
-            write_fcurve_range(cb, path, i, frame_start, aa[:, i], group_name=bone_name, interpolation=interpolation)
+        put(path, aa, tuple(pb.rotation_axis_angle))
     else:
         path = bone_data_path(bone_name, "rotation_euler")
+        have = stored(path, tuple(pb.rotation_euler), T) if keep is not None else None
         eul = np.empty((T, 3), dtype=np.float64)
         prev = None
         for t in range(T):
             q = Quaternion(quat[t])
+            if have is not None:
+                prev = Euler(have[t], rot_mode)
             e = q.to_euler(rot_mode, prev) if prev is not None else q.to_euler(rot_mode)
             prev = e
             eul[t] = (e.x, e.y, e.z)
-        for i in range(3):
-            write_fcurve_range(cb, path, i, frame_start, eul[:, i], group_name=bone_name, interpolation=interpolation)
+        put(path, eul, tuple(pb.rotation_euler))
 
 
 def read_bone_prop_curve(obj, bone_name: str, prop_name: str, frame_start: int, frame_end: int, action=None) -> np.ndarray:

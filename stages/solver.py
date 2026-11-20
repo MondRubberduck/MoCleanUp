@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 import bpy
 import numpy as np
 
-from ..core import action_io, raw_snapshot, runtime, sampler
+from ..core import action_io, chain_sync, raw_snapshot, runtime, sampler
 from ..core.dsp import find_runs
 from ..core.math_quat import (
     blend_window_weights,
@@ -157,6 +157,7 @@ def solver_channel_paths(rig, profile: RigProfile) -> list[str]:
 
     add_loc(profile.torso_ctrl)
     add_rot(profile.torso_ctrl)
+    synced = chain_sync.came_in_sync(rig)
     for limb in profile.limbs():
         add_loc(limb.ik_ctrl)
         add_rot(limb.ik_ctrl)
@@ -164,6 +165,12 @@ def solver_channel_paths(rig, profile: RigProfile) -> list[str]:
         add_rot(limb.toe_ctrl)
         if limb.switch_bone and limb.switch_bone in bones:
             paths.append(action_io.bone_prop_data_path(limb.switch_bone, "IK_FK"))
+        # The FK chain that is keyed to follow the result (``chain_sync``) is part of the result: a pin that
+        # switches an FK arm to IK for twenty frames has the FK controls keyed onto the held hand there, and
+        # they have to go back with everything else when the pin is removed or the solve is.
+        if limb.key in synced:
+            for fk, _org in chain_sync.fk_chain(rig, limb):
+                add_rot(fk)
     return sorted(set(paths))
 
 
@@ -203,15 +210,6 @@ def _pin_targets(pins, rig):
     return out
 
 
-def _token(rig, f0, f1, targets) -> tuple:
-    parts = [rig.name, action_io.get_active_action(rig).name, f0, f1, action_io.action_checksum(rig),
-             tuple(round(v, 6) for row in rig.matrix_world for v in row)]
-    for ob, bone in sorted(targets, key=lambda t: (t[0].name, t[1])):
-        crc = action_io.action_checksum(ob) if action_io.get_active_action(ob) is not None else ""
-        parts.append((ob.name, bone, crc, tuple(round(v, 6) for row in ob.matrix_world for v in row)))
-    return tuple(parts)
-
-
 def prepare_base(rig, profile: RigProfile) -> list[str]:
     """Put the pre-solve curves in place and make sure a base snapshot exists. Returns the solver paths."""
     paths = solver_channel_paths(rig, profile)
@@ -219,6 +217,7 @@ def prepare_base(rig, profile: RigProfile) -> list[str]:
     if raw_snapshot.get_solve_base(rig) is not None:
         if raw_snapshot.solve_is_intact(rig, paths):
             raw_snapshot.restore_solve_base(rig, paths)
+            raw_snapshot.extend_solve_base(rig, paths)     # (a base from 1.3.0: the FK chains join it as they are)
         else:
             raw_snapshot.store_solve_base(rig, paths)      # hand edits become the new base
     else:
@@ -247,11 +246,12 @@ def unbake_for_edit(rig) -> bool:
 
 
 def sample_for_solver(rig, profile: RigProfile, f0: int, f1: int, targets, use_cache: bool = True):
-    """Sample the rig (and pin targets); cached while curves and targets are unchanged."""
-    token = _token(rig, f0, f1, targets)
-    cached = runtime.SOLVE_SAMPLES.get(rig.name)
-    if use_cache and cached is not None and cached[0] == token:
-        return cached[1], cached[2], False
+    """Sample the rig (and pin targets). Returns ``(samples, follow table, whole take sampled)``.
+
+    The sample is kept between solves. A solve starts from the base curves every time, so after a pin was moved
+    almost every frame is as it was: only the frames whose keys changed are evaluated again
+    (``sampler.sample_objects(reuse=...)``). ``use_cache=False`` samples the whole take.
+    """
     requests: dict[str, tuple] = {}
     names = solver_bone_names(profile, rig.data.bones)
     requests[rig.name] = (rig, list(names))
@@ -262,7 +262,11 @@ def sample_for_solver(rig, profile: RigProfile, f0: int, f1: int, targets, use_c
         else:
             requests[ob.name] = (ob, [bone] if bone else None)
     scene = bpy.context.scene
-    samples = sampler.sample_objects(list(requests.values()), f0, f1, scene)
+    samples = sampler.sample_objects(list(requests.values()), f0, f1, scene, reuse="solver" if use_cache else "")
+    whole = sampler.last_reuse == "full"
+    cached = runtime.SOLVE_SAMPLES.get(rig.name)
+    if not whole and cached is not None:
+        return samples, cached[0], False
 
     follow: dict = {}
     if profile.kind != "SKELETON":                     # a skeleton has no controls that follow others
@@ -272,8 +276,8 @@ def sample_for_solver(rig, profile: RigProfile, f0: int, f1: int, targets, use_c
         ctrls = [c for c in ctrls if c]
         drivers = [profile.torso_ctrl] + [limb.ik_ctrl for limb in profile.limbs()]
         follow = sampler.probe_follow(rig, drivers, ctrls)
-    runtime.SOLVE_SAMPLES[rig.name] = (token, samples, follow)
-    return samples, follow, True
+    runtime.SOLVE_SAMPLES[rig.name] = (follow,)
+    return samples, follow, whole
 
 
 # ---------------------------------------------------------------------------
@@ -684,20 +688,27 @@ def solve(rig, pins: list[s4.KinematicPin], settings: SolveSettings | None = Non
         L["ik_active"] = active & ~(L["partial"] & ~L["switched"])
 
     # ---- write: torso ------------------------------------------------------------------------------------------------------
-    def write_ctrl(name, world, parent_pose, loc=True, rot=True):
+    def write_ctrl(name, world, parent_pose, loc=True, rot=True, where=None):
+        """Key the control to ``world``. ``where``: the frames on which it acts (None: all of them). The keys of
+        the others stay exactly as they are - a pin of twenty frames is no reason to touch the other 5,000
+        (they came out a rounding error away from what they were, and the control did not stay with a parent
+        that moved)."""
         nonlocal cb_dirty
+        if where is not None and not where.any():
+            return
         pose = smp.to_pose_space(world)
         new_loc, new_quat = sampler.pose_to_basis(rig, name, pose, parent_pose)
         cur = action_io.read_bone_local_channels(rig, name, f0, f1)
         pb = rig.pose.bones[name]
-        do_loc = loc and not all(pb.lock_location) and float(np.abs(new_loc - cur["loc"]).max()) > 1e-6 * unit / scale
-        do_rot = rot and float(quat_angle_between(new_quat, cur["quat"]).max()) > 1e-5
-        if do_rot:
+        sel = slice(None) if where is None else where
+        do_loc = loc and not all(pb.lock_location) and float(np.abs(new_loc - cur["loc"])[sel].max()) > 1e-6 * unit / scale
+        do_rot = rot and float(quat_angle_between(new_quat, cur["quat"])[sel].max()) > 1e-5
+        if do_rot and where is None:
             ref = quat_hemisphere_continuous(cur["quat"])[0]
             new_quat = np.where(np.sum(new_quat * ref, axis=1, keepdims=True) < 0.0, -new_quat, new_quat)
         if do_loc or do_rot:
             action_io.write_bone_local_channels(rig, name, f0, loc=new_loc if do_loc else None,
-                                                quat=new_quat if do_rot else None)
+                                                quat=new_quat if do_rot else None, only=where)
             res.written.append(name)
             cb_dirty = True
 
@@ -723,15 +734,23 @@ def solve(rig, pins: list[s4.KinematicPin], settings: SolveSettings | None = Non
         # where the solver takes over a blended frame, the IK control has to be on target
         X_out = np.where((L["partial"] & L["switched"])[:, None, None], limb.x_rest[None], L["X"])
         W_ik1 = E1 @ _rigid_inv(X_out)
+        # A limb that is in FK: its IK control (and what hangs from it) is keyed where IK acts - inside the pins
+        # that switch it on, and where the take itself blends - and keeps its keys on the frames that stay in
+        # FK. Keying it onto the FK hand everywhere changed thousands of keys for one pin, and all of them back
+        # when it went. (Where FK is active the chain sync keeps the IK control with the FK hand.)
+        acts = L["ikmode"] | L["partial"]
+        if L["activate"]:
+            acts = acts | (L["ikfk_new"] < 1.0 - 1e-6)
+        L["acts"] = None if acts.all() else acts
         L["W_ik1"] = W_ik1
         L["G_ik"] = smp.to_pose_space(W_ik1) @ _rigid_inv(smp.pose_m(limb.ik_ctrl))
         rel = follow.get(limb.ik_ctrl, {}).get(torso, "NONE")
         P0 = parent_pose_of(limb.ik_ctrl)
         if rel == "PARTIAL" and torso_changed:
-            deferred_ik.append((limb.ik_ctrl, W_ik1))
+            deferred_ik.append((limb.ik_ctrl, W_ik1, L["acts"]))
             continue
         P = (G_torso_pose @ P0) if (rel == "RIGID" and P0 is not None) else P0
-        write_ctrl(limb.ik_ctrl, W_ik1, P)
+        write_ctrl(limb.ik_ctrl, W_ik1, P, where=L["acts"])
         if L["activate"]:
             action_io.write_bone_prop_curve(rig, limb.switch_bone, "IK_FK", f0, L["ikfk_new"])
             res.written.append(limb.switch_bone)
@@ -740,10 +759,11 @@ def solve(rig, pins: list[s4.KinematicPin], settings: SolveSettings | None = Non
                     and bool(np.all(~L["ikmode"])):
                 pb_sw["pole_vector"] = True
     if deferred_ik:
-        smp2 = sampler.sample_objects([(rig, [sampler.parent_name(rig, n) for n, _ in deferred_ik])], f0, f1)[rig.name]
-        for name, W in deferred_ik:
+        parents = [sampler.parent_name(rig, n) for n, _ in deferred_ik]
+        smp2 = sampler.sample_objects([(rig, parents)], f0, f1, reuse="solver.ik_parents")[rig.name]
+        for name, W, where in deferred_ik:
             pn = sampler.parent_name(rig, name)
-            write_ctrl(name, W, smp2.pose_m(pn) if smp2.has(pn) else None)
+            write_ctrl(name, W, smp2.pose_m(pn) if smp2.has(pn) else None, where=where)
 
     # ---- poles and toes ---------------------------------------------------------------------------------------------------------------
     deferred = []
@@ -784,14 +804,15 @@ def solve(rig, pins: list[s4.KinematicPin], settings: SolveSettings | None = Non
             pole1, _ = s5.retarget_pole(L["root0"], L["pos0"], bend, L["root"], L["pos"], along, dist,
                                         fps=fps, smooth_cutoff=st.pole_smooth_hz)
             W_pole1 = W_pole0.copy()
-            # Frames that stay in FK ignore the pole: leave their keys alone.
+            # Frames that stay in FK ignore the pole: their keys are left alone.
             W_pole1[:, :3, 3] = np.where(L["ik_active"][:, None], pole1, W_pole0[:, :3, 3])
             if float(np.abs(W_pole1 - W_pole0).max()) > 2e-5 * unit:
+                where = None if L["ik_active"].all() else L["ik_active"]
                 P, ok = follower_parent(limb.pole_ctrl)
                 if ok:
-                    write_ctrl(limb.pole_ctrl, W_pole1, P, rot=False)
+                    write_ctrl(limb.pole_ctrl, W_pole1, P, rot=False, where=where)
                 else:
-                    deferred.append((limb.pole_ctrl, W_pole1, True, False))
+                    deferred.append((limb.pole_ctrl, W_pole1, True, False, where))
 
         # toes
         if limb.kind == "leg" and st.clip_toes and st.use_floor and limb.toe_ctrl and limb.org_toe and smp.has(limb.org_toe):
@@ -821,14 +842,15 @@ def solve(rig, pins: list[s4.KinematicPin], settings: SolveSettings | None = Non
                 C1 = Tj @ R @ Tn @ C1
                 P, ok = follower_parent(limb.toe_ctrl)
                 if ok:
-                    write_ctrl(limb.toe_ctrl, C1, P, loc=False)
+                    write_ctrl(limb.toe_ctrl, C1, P, loc=False, where=L.get("acts"))
                 else:
-                    deferred.append((limb.toe_ctrl, C1, False, True))
+                    deferred.append((limb.toe_ctrl, C1, False, True, L.get("acts")))
     if deferred:
-        smp2 = sampler.sample_objects([(rig, [sampler.parent_name(rig, n) for n, *_ in deferred])], f0, f1)[rig.name]
-        for name, W, loc, rot in deferred:
+        parents = [sampler.parent_name(rig, n) for n, *_ in deferred]
+        smp2 = sampler.sample_objects([(rig, parents)], f0, f1, reuse="solver.follower_parents")[rig.name]
+        for name, W, loc, rot, where in deferred:
             pn = sampler.parent_name(rig, name)
-            write_ctrl(name, W, smp2.pose_m(pn) if smp2.has(pn) else None, loc=loc, rot=rot)
+            write_ctrl(name, W, smp2.pose_m(pn) if smp2.has(pn) else None, loc=loc, rot=rot, where=where)
 
     raw_snapshot.mark_solved(rig, paths)
     if cb_dirty:

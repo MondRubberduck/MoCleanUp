@@ -225,10 +225,17 @@ def test_snapshots():
     assert np.allclose(action_io.read_bone_local_channels(rig, "foot_ik.L", f0, gt["f1"])["loc"], clean, atol=1e-6)
 
     # solver base: store -> modify -> intact check -> restore (including removal of created curves)
-    paths = [action_io.bone_data_path("foot_ik.L", "location"), action_io.bone_data_path("toe_ik.L", "rotation_quaternion")]
+    paths = [action_io.bone_data_path("foot_ik.L", "location"), action_io.bone_data_path("toe_ik.L", "rotation_quaternion"),
+             action_io.bone_prop_data_path("thigh_parent.L", "IK_FK")]
+    toe, switch = rig.pose.bones["toe_ik.L"], rig.pose.bones["thigh_parent.L"]
+    toe.rotation_quaternion = (0.8, 0.6, 0.0, 0.0)             # channels without a curve, standing off their rest value
+    switch["IK_FK"] = 0.25
     raw_snapshot.store_solve_base(rig, paths)
     action_io.write_bone_local_channels(rig, "foot_ik.L", f0, loc=clean + 1.0)
     action_io.write_bone_local_channels(rig, "toe_ik.L", f0, quat=np.tile([1.0, 0, 0, 0], (gt["T"], 1)))
+    action_io.write_bone_prop_curve(rig, "thigh_parent.L", "IK_FK", f0, np.ones(gt["T"]))
+    bpy.context.scene.frame_set(f0 + 3)                        # the playhead is somewhere: the channels take the curves' values
+    assert abs(float(switch["IK_FK"]) - 1.0) < 1e-6 and abs(toe.rotation_quaternion[1]) < 1e-6
     raw_snapshot.mark_solved(rig, paths)
     assert raw_snapshot.solve_is_intact(rig, paths)
     action_io.write_bone_local_channels(rig, "foot_ik.L", f0, loc=clean + 2.0)
@@ -238,9 +245,166 @@ def test_snapshots():
     assert np.allclose(action_io.read_bone_local_channels(rig, "foot_ik.L", f0, gt["f1"])["loc"], clean, atol=1e-6)
     cb = action_io.get_active_channelbag(rig)
     assert cb.fcurves.find(paths[1], index=0) is None, "curve created by the solver was not removed"
+    assert cb.fcurves.find(paths[2], index=0) is None
+    # ... and those channels stand where they stood, not where the playhead left them (an FK arm that a pin had
+    # switched to IK for a second stayed in IK for the whole take)
+    assert abs(float(switch["IK_FK"]) - 0.25) < 1e-6, float(switch["IK_FK"])
+    assert np.allclose(toe.rotation_quaternion, (0.8, 0.6, 0.0, 0.0), atol=1e-6), tuple(toe.rotation_quaternion)
     assert raw_snapshot.get_solve_base(rig) is None
 
 
+def test_only_the_frames_asked_for_are_keyed():
+    """``write_bone_local_channels(only=...)``: on the other frames no key changes, not by a bit."""
+    rig = fresh_rig()
+    T = 60
+    t = np.linspace(0, 2 * np.pi, T)
+    loc = np.stack([0.1 * np.sin(t), 0.2 * np.cos(t), 0.05 * np.sin(2 * t)], -1)
+    quat = mq.quat_exp(np.stack([0.2 * np.sin(t), 0.1 * np.cos(t), 0.3 * t / 6], -1))
+    mask = np.zeros(T, dtype=bool)
+    mask[20:40] = True
+    new_quat = mq.quat_multiply(mq.quat_axis_angle(np.array([0.0, 0.0, 1.0]), np.full(T, 0.2)), quat)
+    # a quaternion control whose keys change their sign half way (as a take may) and are not quite unit length
+    stored = quat * 1.0003
+    stored[30:] *= -1.0
+    action_io.write_bone_local_channels(rig, "foot_ik.L", 5, loc=loc, quat=stored, enforce_continuity=False)
+    before = action_io.read_bone_local_channels(rig, "foot_ik.L", 5, 64)
+    assert np.sum(before["raw_rot"][29] * before["raw_rot"][30]) < 0.0          # the fixture
+    action_io.write_bone_local_channels(rig, "foot_ik.L", 5, loc=loc + 0.5, quat=new_quat, only=mask)
+    after = action_io.read_bone_local_channels(rig, "foot_ik.L", 5, 64)
+    assert np.array_equal(after["loc"][~mask], before["loc"][~mask])
+    assert np.array_equal(after["raw_rot"][~mask], before["raw_rot"][~mask])
+    assert np.allclose(after["loc"][mask], loc[mask] + 0.5, atol=1e-6)
+    assert np.allclose(np.abs(np.sum(after["quat"] * new_quat, axis=1))[mask], 1.0, atol=1e-6)
+    # ... on the side of the keys they replace: no flip in the curve that the take did not have
+    assert (np.sum(after["raw_rot"] * before["raw_rot"], axis=1)[mask] > 0.0).all()
+    # a Euler control (ZXY): the nearest turn to what is keyed there
+    action_io.write_bone_local_channels(rig, "foot_heel_ik.L", 5, quat=quat)
+    before = action_io.read_bone_local_channels(rig, "foot_heel_ik.L", 5, 64)
+    action_io.write_bone_local_channels(rig, "foot_heel_ik.L", 5, quat=new_quat, only=mask)
+    after = action_io.read_bone_local_channels(rig, "foot_heel_ik.L", 5, 64)
+    assert after["rotation_mode"] == "ZXY" and np.array_equal(after["raw_rot"][~mask], before["raw_rot"][~mask])
+    assert np.allclose(np.abs(np.sum(after["quat"] * new_quat, axis=1))[mask], 1.0, atol=1e-5)
+    assert np.abs(after["raw_rot"] - before["raw_rot"])[mask].max() < 0.5
+    # a channel without keys: the frames that are not asked for get the value it stands at
+    rig.pose.bones["hand_ik.R"].location = (0.1, 0.2, 0.3)
+    action_io.write_bone_local_channels(rig, "hand_ik.R", 5, loc=loc, only=mask)
+    back = action_io.read_bone_local_channels(rig, "hand_ik.R", 5, 64)["loc"]
+    assert np.allclose(back[~mask], (0.1, 0.2, 0.3), atol=1e-6) and np.allclose(back[mask], loc[mask], atol=1e-6)
+
+
+def test_kept_samples():
+    """``sample_objects(reuse=...)``: after an edit only the frames whose curves are not what they were are
+    evaluated again - and what comes back is what a fresh sample of the whole take gives."""
+    rig = fresh_rig()
+    gt = synth_walk(rig, n_frames=80)
+    f0, f1, T = gt["f0"], gt["f1"], gt["T"]
+    names = ["ORG-foot.L", "ORG-shin.L", "ORG-hand.R", "ORG-spine", "foot_ik.L"]
+    sampler.reset_cache()
+
+    def kept(a=f0, b=f1):
+        smp = sampler.sample_objects([(rig, names)], a, b, reuse="test")[rig.name]
+        return smp, sampler.last_reuse, sampler.last_frames
+
+    def is_fresh(smp):
+        ref = sampler.sample_objects([(rig, names)], smp.f0, smp.f1)[rig.name]
+        err = max(float(np.abs(smp.pose - ref.pose).max()), float(np.abs(smp.obj_world - ref.obj_world).max()))
+        assert err < 1e-6, err
+
+    assert kept()[1:] == ("full", T)
+    assert kept()[1:] == ("cached", 0)
+    # the foot control is moved on five frames
+    ch = action_io.read_bone_local_channels(rig, "foot_ik.L", f0, f1)
+    loc = ch["loc"].copy()
+    loc[30:35, 2] += 0.07
+    action_io.write_bone_local_channels(rig, "foot_ik.L", f0, loc=loc)
+    smp, how, n = kept()
+    assert (how, n) == ("partial", 5), (how, n)
+    is_fresh(smp)
+    # keyed again a rounding error away, and with the other sign: the same poses, nothing to evaluate
+    action_io.write_bone_local_channels(rig, "foot_ik.L", f0, loc=loc + 2e-6, quat=-ch["raw_rot"], enforce_continuity=False)
+    assert kept()[1:] == ("cached", 0)
+    # put back as it was: those five frames again
+    action_io.write_bone_local_channels(rig, "foot_ik.L", f0, loc=ch["loc"], quat=ch["raw_rot"], enforce_continuity=False)
+    smp, how, n = kept()
+    assert (how, n) == ("partial", 5), (how, n)
+    is_fresh(smp)
+    # a control that gets its first keys: the frames on which they differ from where it stood
+    q = np.tile([1.0, 0.0, 0.0, 0.0], (T, 1))
+    q[40:46] = mq.quat_axis_angle(np.array([1.0, 0.0, 0.0]), 0.3)
+    action_io.write_bone_local_channels(rig, "torso", f0, loc=gt["torso"], quat=q)
+    smp, how, n = kept()
+    assert (how, n) == ("partial", 6), (how, n)
+    is_fresh(smp)
+    # more than half of the take: all of it
+    loc = ch["loc"].copy()
+    loc[10:60, 0] += 0.02
+    action_io.write_bone_local_channels(rig, "foot_ik.L", f0, loc=loc)
+    smp, how, n = kept()
+    assert how == "full", how
+    is_fresh(smp)
+    # a control without keys is moved, a switch without keys is set: that reaches every frame
+    rig.pose.bones["shoulder.R"].location[2] += 0.03
+    smp, how, n = kept()
+    assert how == "full", how
+    is_fresh(smp)
+    pb = rig.pose.bones["thigh_parent.L"]
+    pb["IK_Stretch"] = 0.0 if float(pb["IK_Stretch"]) > 0.5 else 1.0
+    rig.update_tag()
+    smp, how, n = kept()
+    assert how == "full", how
+    is_fresh(smp)
+    assert kept()[1:] == ("cached", 0)
+    # another frame range is another sample
+    smp, how, n = kept(f0, f1 - 10)
+    assert how == "full" and smp.T == T - 10, (how, smp.T)
+    sampler.reset_cache()
+
+
+def test_a_solve_base_from_an_older_version():
+    """The FK chain controls joined the solve layer after 1.3.0. A base taken before does not know them: its
+    solve still counts as intact, a restore leaves them alone (their curves are not taken for something the
+    solve made and deleted), and they can be taken into the base as they are."""
+    rig = fresh_rig()
+    gt = synth_walk(rig, n_frames=40)
+    f0, f1, T = gt["f0"], gt["f1"], gt["T"]
+    ident = np.tile([1.0, 0.0, 0.0, 0.0], (T, 1))
+    turned = mq.quat_axis_angle(np.array([1.0, 0.0, 0.0]), np.full(T, 0.3))
+    action_io.write_bone_local_channels(rig, "thigh_fk.L", f0, quat=ident)
+    old = [action_io.bone_data_path("foot_ik.L", "location"), action_io.bone_data_path("toe_ik.L", "rotation_quaternion")]
+    new = old + [action_io.bone_data_path("thigh_fk.L", "rotation_quaternion"),
+                 action_io.bone_data_path("shin_fk.L", "rotation_quaternion")]
+    clean = action_io.read_bone_local_channels(rig, "foot_ik.L", f0, f1)["loc"].copy()
+
+    def quat_of(bone):
+        return action_io.read_bone_local_channels(rig, bone, f0, f1)["quat"]
+
+    raw_snapshot.store_solve_base(rig, old)                                        # as 1.3.0 took it
+    action_io.write_bone_local_channels(rig, "foot_ik.L", f0, loc=clean + 1.0)     # its solve ...
+    action_io.write_bone_local_channels(rig, "thigh_fk.L", f0, quat=turned)        # ... and the FK chain keyed after it
+    raw_snapshot.mark_solved(rig, old)
+    assert raw_snapshot.solve_is_intact(rig, new)
+    assert raw_snapshot.restore_solve_base(rig, new)
+    assert np.allclose(action_io.read_bone_local_channels(rig, "foot_ik.L", f0, f1)["loc"], clean, atol=1e-6)
+    cb = action_io.get_active_channelbag(rig)
+    assert cb.fcurves.find(new[2], index=0) is not None, "a curve the base does not know was deleted"
+    assert np.allclose(quat_of("thigh_fk.L"), turned, atol=1e-6)
+    assert raw_snapshot.extend_solve_base(rig, new) == 2 and raw_snapshot.extend_solve_base(rig, new) == 0
+    # from here on they belong to the layer: restored with the rest, and a curve the solve makes on them goes again
+    action_io.write_bone_local_channels(rig, "foot_ik.L", f0, loc=clean + 1.0)
+    action_io.write_bone_local_channels(rig, "thigh_fk.L", f0, quat=ident)
+    action_io.write_bone_local_channels(rig, "shin_fk.L", f0, quat=turned)
+    raw_snapshot.mark_solved(rig, new)
+    assert raw_snapshot.solve_is_intact(rig, new)
+    action_io.write_bone_local_channels(rig, "shin_fk.L", f0, quat=ident)
+    assert not raw_snapshot.solve_is_intact(rig, new)                              # a hand edit of the FK chain counts
+    action_io.write_bone_local_channels(rig, "shin_fk.L", f0, quat=turned)
+    assert raw_snapshot.unbake_solve(rig, new)
+    assert np.allclose(quat_of("thigh_fk.L"), turned, atol=1e-6)
+    assert cb.fcurves.find(new[3], index=0) is None, "curve created by the solve was not removed"
+    assert np.allclose(action_io.read_bone_local_channels(rig, "foot_ik.L", f0, f1)["loc"], clean, atol=1e-6)
+
+
 if __name__ == "__main__":
-    run_tests([test_dsp, test_quat_math, test_action_io_roundtrip, test_sampler_world_roundtrip, test_isolated_sampling,
-               test_snapshots])
+    run_tests([test_dsp, test_quat_math, test_action_io_roundtrip, test_only_the_frames_asked_for_are_keyed,
+               test_sampler_world_roundtrip, test_isolated_sampling, test_kept_samples, test_snapshots,
+               test_a_solve_base_from_an_older_version])

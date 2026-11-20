@@ -6,7 +6,7 @@ from __future__ import annotations
 REPORTS: dict[str, object] = {}
 # rig name -> dict with sampled world data for the viewport HUD (centre of mass, soles, contacts)
 MOTION: dict[str, dict] = {}
-# rig name -> (token, samples, follow table) for fast contact re-solves
+# rig name -> (follow table,) of the last full sample for the contact solver (the sample itself: core.sampler)
 SOLVE_SAMPLES: dict[str, tuple] = {}
 # rig name -> SolveResult of the last contact solve
 SOLVE_RESULTS: dict[str, object] = {}

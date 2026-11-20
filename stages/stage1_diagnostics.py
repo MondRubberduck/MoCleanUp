@@ -597,7 +597,7 @@ def _world_checks(rig, profile, report, f0, f1, fps, floor_z, floor_object, hype
     issues: list[Issue] = []
     unit = profile.unit
     T = f1 - f0 + 1
-    smp = sampler.sample_objects([(rig, solver_bone_names(profile, rig.data.bones))], f0, f1)[rig.name]
+    smp = sampler.sample_objects([(rig, solver_bone_names(profile, rig.data.bones))], f0, f1, reuse="analyze")[rig.name]
     report.joints = body_joints(profile, smp)
     depsgraph = bpy.context.evaluated_depsgraph_get()
     floor = s4.Floor(floor_z, floor_object, depsgraph)

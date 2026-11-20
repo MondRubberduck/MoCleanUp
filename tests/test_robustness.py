@@ -830,15 +830,11 @@ def test_the_fk_chain_follows_the_cleanup():
     assert action_io.action_checksum(rig) == crc
 
 
-def test_solves_do_not_stack_when_both_chains_are_keyed():
-    """A Rig Bridge take has arms in FK with the IK hand control keyed along. After a solve the chain sync keys
-    that IK control again - a channel of the solve layer. That is part of the result, not a hand edit of it:
-    the next solve still starts from the take as it was, and Remove Solve gives it back (sanity check before
-    1.3.1: the solved state had become the new base, so re-solves stacked and Remove Solve returned the first
-    solve instead of the take)."""
+def _both_chains_keyed():
+    """A take as Rig Bridge bakes it: arms in FK, legs in IK, and on every limb the other chain keyed along (the
+    chains agree, and the add-on is told so). Returns ``(rig, ground truth, settings, profile)``."""
     from mocap_cleanup.core import chain_sync, raw_snapshot
     from mocap_cleanup.core.rig_inspector import inspect_rig
-    from mocap_cleanup.stages import solver
     rig, gt, st = ta.make_scene()
     for pb in rig.pose.bones:
         pb.ik_stretch = 0.0
@@ -846,29 +842,43 @@ def test_solves_do_not_stack_when_both_chains_are_keyed():
     gt = synth_walk(rig, n_frames=gt["T"], stride=0.6, drop=0.12)
     corrupt_feet(rig, gt)                                                       # feet sink: the solve raises the body
     profile = inspect_rig(rig)
-    f0, f1, T = gt["f0"], gt["f1"], gt["T"]
-    ident = np.tile([1.0, 0.0, 0.0, 0.0], (T, 1))
+    ident = np.tile([1.0, 0.0, 0.0, 0.0], (gt["T"], 1))
     for limb in profile.limbs():
         for fk, _org in chain_sync.fk_chain(rig, limb):
-            action_io.write_bone_local_channels(rig, fk, f0, quat=ident)
+            action_io.write_bone_local_channels(rig, fk, gt["f0"], quat=ident)
     snap = raw_snapshot.ensure_raw_snapshot(rig)
     snap[chain_sync.SYNC_KEY] = ",".join(l.key for l in profile.limbs())
     assert chain_sync.sync(rig, profile), "nothing was written"                  # legs: FK follows; arms: IK follows
     assert raw_snapshot.delete_raw_snapshot(rig)
-    paths = solver.solver_channel_paths(rig, profile)
+    return rig, gt, st, profile
+
+
+def test_solves_do_not_stack_when_both_chains_are_keyed():
+    """A Rig Bridge take has arms in FK with the IK hand control keyed along. After a solve the chain sync keys
+    that IK control again - a channel of the solve layer. That is part of the result, not a hand edit of it:
+    the next solve still starts from the take as it was, and Remove Solve gives it back (sanity check before
+    1.3.1: the solved state had become the new base, so re-solves stacked and Remove Solve returned the first
+    solve instead of the take)."""
+    from mocap_cleanup.core import chain_sync, raw_snapshot
+    rig, gt, st, profile = _both_chains_keyed()
+    f0, f1, T = gt["f0"], gt["f1"], gt["T"]
+    paths: list[str] = []
 
     def layer(action=None):
         return {(fc.data_path, fc.array_index): action_io.sample_fcurve_range(fc, f0, f1)
-                for fc in action_io.iter_fcurves(rig, action) if fc.data_path in set(paths)}
+                for fc in action_io.iter_fcurves(rig, action) if not paths or fc.data_path in set(paths)}
 
     def same(a, b):
         return set(a) == set(b) and all(np.array_equal(a[k], b[k]) for k in a)
 
-    take = layer()
+    everything = layer()
     hand0 = action_io.read_bone_local_channels(rig, "hand_ik.L", f0, f1)["loc"].copy()
     assert bpy.ops.mocap.detect_contacts() == {"FINISHED"}                      # Live Update: solves
     data = rig.mocap_cleanup
     assert chain_sync.came_in_sync(rig) >= {"arm.L", "arm.R", "leg.L", "leg.R"}, chain_sync.came_in_sync(rig)
+    paths += solver.solver_channel_paths(rig, profile)       # (known now: with the FK chains that follow the result)
+    assert sum("_fk." in p for p in paths) >= 12, paths
+    take = {k: v for k, v in everything.items() if k[0] in set(paths)}
     # hold the hips for a moment: the body (and the FK arms on it) moves, the IK hand controls have to follow
     bpy.context.scene.frame_set(f0 + 30)
     st.pin_limb, st.pin_hold, st.pin_position, st.pin_rotation, st.pin_length = "torso", "WORLD", True, True, 15
@@ -888,6 +898,130 @@ def test_solves_do_not_stack_when_both_chains_are_keyed():
     worst = max(float(np.abs(back[k] - take[k]).max()) for k in take if not k[0].startswith('pose.bones["hand_ik')
                 and "upper_arm_ik_target" not in k[0])
     assert set(back) == set(take) and worst == 0.0, worst                       # the take as it was before the solve
+
+
+def test_a_hand_pin_on_an_fk_arm_goes_without_a_trace():
+    """Arms in FK (a Rig Bridge take). A pin on a hand switches the arm to IK while it holds, and the chain sync
+    keys the FK controls onto the held hand there. All of that is the solve's: it is keyed on the frames the pin
+    reaches and nowhere else, and it goes when the pin does, or the solve.
+
+    (Sanity check before 1.3.1, a 3-minute take: the FK controls were not part of the solve layer. The held pose
+    stayed in the arm when the pin was removed - the hand 33 cm off for a second - and after Remove Solve too.
+    And one pin had the IK control, the pole and the FK controls keyed again along the whole take, by a rounding
+    error on most frames: every kept sample was taken again, 40 seconds for each pin edit. Here the IK/FK switch
+    has no keys, as on a rig that was set to FK by hand: the curve the pin gave it went again, but the switch kept
+    the value of the frame the playhead was on - inside the pin, IK. The arm was in IK for the whole take.)"""
+    from mocap_cleanup.core import chain_sync, sampler
+    rig, gt, st, profile = _both_chains_keyed()
+    f0, f1, T = gt["f0"], gt["f1"], gt["T"]
+    scene, data = bpy.context.scene, rig.mocap_cleanup
+    arm = {fk for fk, _org in chain_sync.fk_chain(rig, profile.limb_by_key("arm.L"))}
+    watched = arm | {"hand_ik.L", "upper_arm_ik_target.L"}
+
+    def keys(bones):
+        return {(fc.data_path, fc.array_index): action_io.sample_fcurve_range(fc, f0, f1)
+                for fc in action_io.iter_fcurves(rig) if action_io.fcurve_bone_name(fc) in bones}
+
+    def hand():
+        return sampler.sample_objects([(rig, ["ORG-hand.L"])], f0, f1)[rig.name].head_w("ORG-hand.L").copy()
+
+    def apart(a, b):
+        assert set(a) == set(b), sorted(set(a) ^ set(b))
+        return max(float(np.abs(a[k] - b[k]).max()) for k in a)
+
+    take = keys(arm)
+    assert len(take) == 12, sorted(take)
+    assert bpy.ops.mocap.detect_contacts() == {"FINISHED"}                      # Live Update: solves
+    assert "arm.L" in chain_sync.came_in_sync(rig)
+    assert apart(keys(arm), take) == 0.0                                        # an arm in FK: nothing to key on it
+    cleaned, hand0 = keys(watched), hand()
+
+    passes = []
+    sample_objects = sampler.sample_objects
+
+    def spy(*args, **kw):
+        out = sample_objects(*args, **kw)
+        if kw.get("reuse"):
+            passes.append((kw["reuse"], sampler.last_reuse, sampler.last_frames))
+        return out
+
+    sampler.sample_objects = spy
+    try:
+        scene.frame_set(f0 + 40)
+        st.pin_limb, st.pin_hold, st.pin_position, st.pin_rotation, st.pin_length = "arm.L", "WORLD", True, True, 12
+        assert bpy.ops.mocap.pin_from_here() == {"FINISHED"}
+        pin = next(p for p in data.pins if p.owner == "arm.L")
+        held = keys(watched)
+        assert float(np.linalg.norm(hand() - hand0, axis=1).max()) > 0.03       # the fixture: the pin holds the hand back
+        # keyed where the pin reaches, and nowhere else - not by a bit
+        switch = 6                                                              # (the IK/FK switch blends over 0.13 s)
+        lo = pin.lock_in - f0 - pin.blend_in - switch
+        hi = pin.lock_out - f0 + pin.blend_out + switch
+        for k, was in cleaned.items():
+            frames = np.flatnonzero(held[k] != was)
+            assert not len(frames) or (frames[0] >= lo and frames[-1] <= hi), (k, int(frames[0]), int(frames[-1]), lo, hi)
+        assert max(float(np.abs(held[k] - cleaned[k]).max()) for k in cleaned if "_fk." in k[0]) > 0.01   # FK follows
+        pin.lock_out += 2                                                       # the pin is edited
+        assert autosolve.flush() == 1
+        assert bpy.ops.mocap.pin_remove() == {"FINISHED"}
+        autosolve.flush()
+    finally:
+        sampler.sample_objects = sample_objects
+    # ... and for that, no kept sample had to be taken again
+    assert passes and all(how != "full" for _name, how, _n in passes), passes
+    # the pin is gone: the arm is the take again and in FK, the rest as the cleanup had it
+    switch = rig.pose.bones["upper_arm_parent.L"]
+    assert scene.frame_current == f0 + 40 and float(switch["IK_FK"]) == 1.0, float(switch["IK_FK"])
+    assert apart(keys(arm), take) == 0.0
+    assert apart(keys(watched), cleaned) < 1e-5
+    assert float(np.abs(hand() - hand0).max()) < 1e-5
+    # and with the pin in place, the solve goes: the take
+    assert bpy.ops.mocap.pin_from_here() == {"FINISHED"}
+    assert apart(keys(arm), take) > 0.01 and float(switch["IK_FK"]) < 0.5
+    assert bpy.ops.mocap.clear_solve() == {"FINISHED"}
+    assert apart(keys(arm), take) == 0.0 and float(switch["IK_FK"]) == 1.0, float(switch["IK_FK"])
+
+
+def test_a_take_solved_by_an_older_version():
+    """A file saved with a solve from 1.3.0: its base does not hold the FK chain controls. The next solve starts
+    from that base as before (it is not taken for a hand edit, which would make the solved take the new base),
+    leaves the FK curves in place, and takes them into the base."""
+    import json
+    from mocap_cleanup.core import raw_snapshot
+    rig, gt, st, profile = _both_chains_keyed()
+    f0, f1 = gt["f0"], gt["f1"]
+    data = rig.mocap_cleanup
+    assert bpy.ops.mocap.detect_contacts() == {"FINISHED"}
+    paths = solver.solver_channel_paths(rig, profile)
+    fk = [p for p in paths if "_fk." in p]
+    old = [p for p in paths if p not in fk]
+    assert len(fk) >= 12, fk
+    # make the base what 1.3.0 left behind
+    base = raw_snapshot.get_solve_base(rig)
+    cb = action_io.get_active_channelbag(rig, base)
+    for fc in [fc for fc in cb.fcurves if fc.data_path in fk]:
+        cb.fcurves.remove(fc)
+    base[raw_snapshot.BASE_MISSING_KEY] = json.dumps(sorted(set(json.loads(base[raw_snapshot.BASE_MISSING_KEY])) - set(fk)))
+    rig.animation_data.action[raw_snapshot.SOLVED_CRC_KEY] = action_io.channels_checksum(rig, old)
+
+    def layer(action=None):
+        return {(fc.data_path, fc.array_index): action_io.sample_fcurve_range(fc, f0, f1)
+                for fc in action_io.iter_fcurves(rig, action) if fc.data_path in set(old)}
+
+    def fk_curves(action=None):
+        return {(fc.data_path, fc.array_index) for fc in action_io.iter_fcurves(rig, action) if fc.data_path in set(fk)}
+
+    before, have = layer(base), fk_curves()
+    assert raw_snapshot.solve_is_intact(rig, paths)
+    pin = next(p for p in data.pins if p.owner == "leg.L" and p.lock_out - p.lock_in > 10)
+    pin.lock_out -= 2
+    assert autosolve.flush() == 1
+    base = raw_snapshot.get_solve_base(rig)
+    after = layer(base)
+    assert set(after) == set(before) and all(np.array_equal(after[k], before[k]) for k in before), "the solved take became the base"
+    assert fk_curves() == have, "FK curves were deleted"
+    assert fk_curves(base) == have                                              # they are part of the layer from here on
+    assert raw_snapshot.solve_is_intact(rig, paths)
 
 
 def test_unexpected_errors_are_reported_not_swallowed():
@@ -930,4 +1064,5 @@ if __name__ == "__main__":
                test_a_contact_is_cut_where_the_foot_travels, test_a_detected_pin_gives_way,
                test_a_planted_foot_turns_on_its_ball, test_the_fk_chain_follows_the_cleanup,
                test_solves_do_not_stack_when_both_chains_are_keyed,
+               test_a_hand_pin_on_an_fk_arm_goes_without_a_trace, test_a_take_solved_by_an_older_version,
                test_unexpected_errors_are_reported_not_swallowed])

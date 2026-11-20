@@ -9,10 +9,14 @@ using the sampled per-frame parent matrices. No "static parent" assumption is ma
 
 from __future__ import annotations
 
+import re
+import zlib
+
 import bpy
 import numpy as np
 from mathutils import Matrix, Vector
 
+from . import action_io
 from .math_quat import quat_from_matrix, quat_hemisphere_continuous
 
 
@@ -59,14 +63,230 @@ class RigSample:
 
 ISOLATED_SCENE = "mocap_cleanup_sampling"
 last_mode = ""                       # "isolated" or "scene": how the last call evaluated the rig
+last_reuse = ""                      # "full", "partial" or "cached": what the last call had to evaluate
+last_frames = 0                      # ... and on how many frames
 _trusted: set[frozenset] = set()     # object sets whose isolated evaluation matched the scene
 _scene_bound: set[frozenset] = set() # object sets that only evaluate correctly inside their scene
 _probe = 0
+_kept: dict[tuple, dict] = {}        # (reuse name, object names) -> the sample kept under that name
+_no_reuse: set[tuple] = set()        # ... for which updating single frames did not reproduce the kept sample
+KEEP_SETS = 3                        # characters whose samples are kept at the same time
 
 
 def reset_cache() -> None:
     _trusted.clear()
     _scene_bound.clear()
+    _kept.clear()
+    _no_reuse.clear()
+
+
+# ---------------------------------------------------------------------------
+# Which frames changed
+# ---------------------------------------------------------------------------
+
+def _plain(value):
+    if isinstance(value, (bool, int, float, str)):
+        return value
+    if hasattr(value, "to_dict"):
+        return repr(value.to_dict())
+    if hasattr(value, "to_list"):
+        return tuple(value.to_list())
+    return type(value).__name__
+
+
+def _static_signature(obj, action) -> tuple:
+    """What the pose depends on besides curves and un-keyed channels: the action and the object's transform.
+    Constraint settings are not watched."""
+    return (action.name if action is not None else "", tuple(round(v, 6) for row in obj.matrix_world for v in row),
+            len(obj.pose.bones) if obj.type == "ARMATURE" else 0)
+
+
+SAME = 1e-5                          # a curve within this of what it was has not changed (channel units)
+_MIX = np.uint64(0x9E3779B97F4A7C15)
+_COLS = np.array([0x9E3779B97F4A7C15, 0xC2B2AE3D27D4EB4F, 0x165667B19E3779F9, 0x27D4EB2F165667C5, 0x85EBCA77C2B2AE63,
+                  0xD6E8FEB86659FD93, 0xA0761D6478BD642F], dtype=np.uint64)
+
+
+_CHANNELS = {"location": (0, 3), "rotation_quaternion": (3, 4), "rotation_euler": (7, 3), "rotation_axis_angle": (10, 4),
+             "scale": (14, 3)}
+_BONE_PATH = re.compile(r'^pose\.bones\["(.*)"\]\.(\w+)$')
+
+
+class CurveState:
+    """What ``obj``'s pose depends on at every frame of a range, to tell later which frames are still the same.
+
+    * a row of values per curve that has one key per frame (a baked take) or is constant;
+    * a 64-bit sum per frame over the keys of all other (sparse) curves;
+    * the values of the channels and custom properties that are not keyed, and the signature.
+    """
+
+    def __init__(self, obj, f0: int, f1: int):
+        T = f1 - f0 + 1
+        self.T = T
+        rows: dict[tuple, np.ndarray] = {}
+        sparse = np.zeros(T, dtype=np.uint64)
+        keyed: set[tuple] = set()
+        with np.errstate(over="ignore"):
+            for fc in action_io.iter_fcurves(obj):
+                pts = fc.keyframe_points
+                n = len(pts)
+                if not n:
+                    continue
+                ident = (fc.data_path, fc.array_index)
+                keyed.add(ident)
+                co = np.empty(n * 2, dtype=np.float32)
+                pts.foreach_get("co", co)
+                co = co.reshape(n, 2)
+                x = co[:, 0]
+                if n == 1 or bool(np.all(co[:, 1] == co[0, 1])):
+                    rows[ident] = np.full(T, co[0, 1], dtype=np.float32)           # constant, however it is keyed
+                    continue
+                if float(x[-1] - x[0]) == n - 1 and bool(np.all(np.diff(x) == 1.0)):
+                    # one key per frame: the value on each frame, held before and after the keys
+                    row = np.empty(T, dtype=np.float32)
+                    first = int(round(float(x[0]))) - f0
+                    a, b = max(first, 0), min(first + n, T)
+                    row[: max(min(first, T), 0)] = co[0, 1]
+                    row[max(first + n, 0) :] = co[-1, 1]
+                    if b > a:
+                        row[a:b] = co[a - first : b - first, 1]
+                    rows[ident] = row
+                    continue
+                # sparse keys: a sum per frame over the keys that decide the value there (the key, its handles and
+                # interpolation, over the span to its neighbours). Whole numbers that wrap around, so the sum
+                # does not depend on the order of the curves.
+                seed = np.uint64(zlib.crc32(f"{fc.data_path}|{fc.array_index}".encode()))
+                mult = (seed * _MIX + np.uint64(0x632BE59BD9B4E019)) | np.uint64(1)
+                data = np.empty((n, 7), dtype=np.float32)
+                data[:, 0:2] = co
+                buf = np.empty(n * 2, dtype=np.float32)
+                pts.foreach_get("handle_left", buf)
+                data[:, 2:4] = buf.reshape(n, 2)
+                pts.foreach_get("handle_right", buf)
+                data[:, 4:6] = buf.reshape(n, 2)
+                kind = np.empty(n, dtype=np.int32)
+                pts.foreach_get("interpolation", kind)
+                data[:, 6] = kind
+                key = (data.view(np.uint32).astype(np.uint64) * _COLS[None, :]).sum(axis=1, dtype=np.uint64) * mult
+                lo = np.concatenate([[0], np.clip(np.floor(x[:-1]).astype(np.int64) - f0, 0, T)])
+                hi = np.concatenate([np.clip(np.ceil(x[1:]).astype(np.int64) - f0 + 1, 0, T), [T]])
+                steps = np.zeros(T + 1, dtype=np.uint64)
+                np.add.at(steps, lo, key)
+                np.subtract.at(steps, hi, key)
+                sparse += np.cumsum(steps, dtype=np.uint64)[:T]
+        self.signature = _static_signature(obj, action_io.get_active_action(obj))
+        self.keys = tuple(sorted(rows))
+        self.index = {k: i for i, k in enumerate(self.keys)}
+        self.values = np.stack([rows[k] for k in self.keys]) if rows else np.zeros((0, T), dtype=np.float32)
+        # rows that are the four components of one quaternion: q and -q are the same rotation
+        quats = [[self.index.get((path, i)) for i in range(4)] for path, j in self.keys
+                 if j == 0 and path.endswith("rotation_quaternion")]
+        self.quats = np.array([q for q in quats if None not in q], dtype=np.int64).reshape(-1, 4)
+        self.sparse = sparse
+        # what is not keyed: channels of the pose bones, custom properties
+        self.static: dict[tuple, float] = {}
+        self.other: tuple = ()
+        if obj.type == "ARMATURE":
+            bones = obj.pose.bones
+            n = len(bones)
+            flat = np.empty((n, 17), dtype=np.float32)
+            for prop, (col, width) in _CHANNELS.items():
+                buf = np.empty(n * width, dtype=np.float32)
+                bones.foreach_get(prop, buf)
+                flat[:, col : col + width] = buf.reshape(n, width)
+            self._flat = flat
+            self._rows = {pb.name: i for i, pb in enumerate(bones)}
+            other = []
+            for pb in bones:
+                for name in pb.keys():
+                    ident = (action_io.bone_prop_data_path(pb.name, name), 0)
+                    if ident in keyed:
+                        continue
+                    value = pb[name]
+                    if isinstance(value, (bool, int, float)):
+                        self.static[ident] = float(value)
+                    else:
+                        other.append((pb.name, name, _plain(value)))
+            self.other = tuple(other)
+        else:
+            self._flat = np.zeros((0, 17), dtype=np.float32)
+            self._rows = {}
+        self._keyed = keyed
+
+    def _unkeyed(self, ident: tuple):
+        """Value of a channel that has no curve here (None: not one this class knows)."""
+        if ident in self._keyed:
+            return None
+        if ident in self.static:
+            return self.static[ident]
+        m = _BONE_PATH.match(ident[0])
+        if m and m.group(2) in _CHANNELS and m.group(1) in self._rows:
+            col, width = _CHANNELS[m.group(2)]
+            if ident[1] < width:
+                return float(self._flat[self._rows[m.group(1)], col + ident[1]])
+        return None
+
+    def _row(self, ident: tuple):
+        i = self.index.get(ident)
+        if i is not None:
+            return self.values[i]
+        value = self._unkeyed(ident)
+        return None if value is None else np.full(self.T, value, dtype=np.float32)
+
+    def changed_since(self, then: "CurveState") -> np.ndarray:
+        """Frames ``(T,)`` on which something is not what it was in ``then``.
+
+        Curve values are compared with a tolerance (``SAME``): what the cleanup writes again comes out of an
+        evaluated pose and differs in the last digits on frames nothing happened to. A channel that got its
+        first curve is compared with the value it had without one. Anything that cannot be compared frame by
+        frame - the signature, sparse keys, an un-keyed control that was moved - counts for every frame it can
+        reach."""
+        T = self.T
+        everything = np.ones(T, dtype=bool)
+        if self.signature != then.signature or self.other != then.other or self._flat.shape != then._flat.shape or T != then.T:
+            return everything
+        free = np.ones(self._flat.shape, dtype=bool)                  # channels without a curve in both
+        for state in (self, then):
+            for path, i in state._keyed:
+                m = _BONE_PATH.match(path)
+                if m and m.group(2) in _CHANNELS and m.group(1) in state._rows and i < _CHANNELS[m.group(2)][1]:
+                    free[state._rows[m.group(1)], _CHANNELS[m.group(2)][0] + i] = False
+        if np.any((np.abs(self._flat - then._flat) > SAME) & free):
+            return everything
+        for ident in self.static.keys() & then.static.keys():
+            if abs(self.static[ident] - then.static[ident]) > SAME:
+                return everything
+        changed = self.sparse != then.sparse
+        if self.keys == then.keys:
+            if len(self.keys):
+                diff = np.abs(self.values - then.values) > SAME
+                if len(self.quats):
+                    # the same rotation with the other sign is no change
+                    flipped = (np.abs(self.values[self.quats] + then.values[self.quats]) <= SAME).all(axis=1)   # (Q, T)
+                    diff[self.quats] &= ~flipped[:, None, :]
+                changed |= diff.any(axis=0)
+            return changed
+        for ident in set(self.keys) | set(then.keys):
+            a, b = self._row(ident), then._row(ident)
+            if a is None or b is None:
+                return everything
+            changed |= np.abs(a - b) > SAME
+        return changed
+
+    def take(self, now: "CurveState", idx: np.ndarray) -> "CurveState":
+        """The state after the frames ``idx`` were sampled again in the state ``now``: those frames as they are
+        now, the others as they were when they were sampled."""
+        keep = np.ones(self.T, dtype=bool)
+        keep[idx] = False
+        if now.keys == self.keys:
+            now.values[:, keep] = self.values[:, keep]
+        else:
+            for i, ident in enumerate(now.keys):
+                old = self._row(ident)
+                if old is not None:
+                    now.values[i, keep] = old[keep]
+        now.sparse[keep] = self.sparse[keep]
+        return now
 
 
 def _read(obj, entry, t: int) -> None:
@@ -102,10 +322,11 @@ def _sample_isolated(entries, f0: int, T: int, scene, frames=None) -> None:
 
 
 def _sample_scene(entries, f0: int, T: int, scene, frames=None, hide_other_meshes: bool = True):
+    # (with ``frames`` the default only hides meshes for more than three of them: probes stay cheap and exact)
     """Step the user's scene. ``frames``: only these indices, returned as ``{t: [(world, pose), ...]}``."""
     keep = {e[0].name for e in entries}
     hidden = []
-    if hide_other_meshes and frames is None:
+    if hide_other_meshes and (frames is None or len(frames) > 3):
         # Deforming meshes are expensive to evaluate and irrelevant for bone matrices.
         for ob in scene.objects:
             if ob.type == "MESH" and ob.name not in keep and not ob.hide_viewport and ob.modifiers:
@@ -146,20 +367,7 @@ def _agrees(entries, probes: dict) -> bool:
     return True
 
 
-def sample_objects(requests: list[tuple[object, list[str] | None]], f0: int, f1: int, scene=None,
-                   hide_other_meshes: bool = True, isolate: bool = True) -> dict[str, RigSample]:
-    """Record the evaluated matrices of all requested objects for every frame of ``[f0, f1]``.
-
-    ``requests``: ``(object, bone names)`` pairs; bone names are ignored for non-armature objects.
-    Returns ``{object.name: RigSample}``.
-
-    The objects are evaluated on their own in a temporary scene (several times faster in a
-    production scene with more characters and meshes) and a few frames are compared with the real
-    scene. If they differ - physics, drivers reading the scene - the whole scene is stepped instead.
-    """
-    global last_mode, _probe
-    scene = scene or bpy.context.scene
-    T = f1 - f0 + 1
+def _entries(requests, T: int):
     entries = []
     seen = set()
     for obj, names in requests:
@@ -176,8 +384,109 @@ def sample_objects(requests: list[tuple[object, list[str] | None]], f0: int, f1:
         else:
             names, idx, buf, pose = [], None, None, np.empty((T, 0, 4, 4), dtype=np.float64)
         entries.append((obj, names, idx, buf, pose, np.empty((T, 4, 4), dtype=np.float64)))
+    return entries, frozenset(seen)
 
-    key = frozenset(seen)
+
+def sample_objects(requests: list[tuple[object, list[str] | None]], f0: int, f1: int, scene=None,
+                   hide_other_meshes: bool = True, isolate: bool = True, reuse: str = "") -> dict[str, RigSample]:
+    """Record the evaluated matrices of all requested objects for every frame of ``[f0, f1]``.
+
+    ``requests``: ``(object, bone names)`` pairs; bone names are ignored for non-armature objects.
+    Returns ``{object.name: RigSample}``.
+
+    The objects are evaluated on their own in a temporary scene (several times faster in a
+    production scene with more characters and meshes) and a few frames are compared with the real
+    scene. If they differ - physics, drivers reading the scene - the whole scene is stepped instead.
+
+    ``reuse``: a name for this caller's sample. Evaluating a control rig is what takes the time (7 s for a
+    3-minute take), and after a small edit almost every frame is as it was. The sample taken under this name
+    is kept, and the next call evaluates only the frames whose curves are not what they were when that frame
+    was sampled (``CurveState``), plus one that did not change, as a check. The samples returned are then the kept ones, updated in place: do not hold
+    on to them across calls. ``last_reuse`` / ``last_frames`` say what had to be evaluated.
+    """
+    global last_reuse, last_frames
+    scene = scene or bpy.context.scene
+    T = f1 - f0 + 1
+    if not reuse:
+        last_reuse, last_frames = "full", T
+        return _sample_full(requests, f0, f1, scene, hide_other_meshes, isolate)
+
+    objects = {}
+    for obj, _names in requests:
+        if obj is not None:
+            objects.setdefault(obj.name, obj)
+    key = (reuse, tuple(sorted(objects)))
+    now = {name: CurveState(obj, f0, f1) for name, obj in objects.items()}
+    wanted = {e[0].name: tuple(e[1]) for e in _entries(requests, 0)[0]}
+    kept = _kept.get(key)
+    if kept is not None and kept["range"] == (f0, f1) and kept["names"] == wanted and key not in _no_reuse:
+        changed = np.zeros(T, dtype=bool)
+        for name, state in now.items():
+            changed |= state.changed_since(kept["curves"][name])
+        n = int(changed.sum())
+        if n == 0:
+            last_reuse, last_frames = "cached", 0
+            return kept["samples"]
+        if n <= 0.5 * T and _update_frames(kept, requests, f0, np.flatnonzero(changed), ~changed, scene, isolate):
+            idx = np.flatnonzero(changed)
+            for name, state in now.items():                   # frames left alone keep what they were sampled at
+                kept["curves"][name] = kept["curves"][name].take(state, idx)
+            last_reuse, last_frames = "partial", n
+            return kept["samples"]
+    samples = _sample_full(requests, f0, f1, scene, hide_other_meshes, isolate)
+    _kept.pop(key, None)                                      # (newest last)
+    _kept[key] = {"range": (f0, f1), "names": wanted, "curves": now, "samples": samples}
+    sets = list(dict.fromkeys(k[1] for k in _kept))           # oldest first
+    for old in sets[:-KEEP_SETS]:
+        for k in [k for k in _kept if k[1] == old]:
+            del _kept[k]
+    last_reuse, last_frames = "full", T
+    return samples
+
+
+def _update_frames(kept: dict, requests, f0: int, idx: np.ndarray, same: np.ndarray, scene, isolate: bool) -> bool:
+    """Evaluate the frames ``idx`` again and put them into the kept sample. False if a frame that should be as
+    it was is not (a rig whose pose depends on other frames): then the whole take has to be sampled."""
+    global _probe
+    check = np.flatnonzero(same)
+    probe = None
+    if len(check):
+        _probe += 1
+        probe = int(check[(_probe * 7919) % len(check)])
+        idx = np.append(idx, probe)
+    entries, key = _entries(requests, len(idx))
+    if isolate and key in _trusted and key not in _scene_bound:
+        _sample_isolated(entries, f0, len(idx), scene, frames=[f0 + int(i) for i in idx])
+    else:
+        rows = _sample_scene(entries, f0, len(idx), scene, frames=[int(i) for i in idx], hide_other_meshes=len(idx) > 3)
+        for k, i in enumerate(idx):
+            for entry, (world, mats) in zip(entries, rows[int(i)]):
+                entry[5][k] = world
+                if mats is not None:
+                    entry[4][k] = mats
+    samples = kept["samples"]
+    if probe is not None:
+        for obj, _names, _idx, _buf, pose, ow in entries:
+            smp = samples[obj.name]
+            for new, old in ((ow[-1], smp.obj_world[probe]), (pose[-1], smp.pose[probe])):
+                if new.size and np.abs(new - old).max() > 1e-4 * max(1.0, float(np.abs(new).max())):
+                    _no_reuse.add(next(k for k, v in _kept.items() if v is kept))
+                    print(f"MoCap Cleanup: the pose of {obj.name!r} depends on other frames; sampling the whole take")
+                    return False
+        idx = idx[:-1]
+    n = len(idx)
+    for obj, _names, _idx, _buf, pose, ow in entries:
+        smp = samples[obj.name]
+        smp.pose[idx] = pose[:n]
+        smp.obj_world[idx] = ow[:n]
+        smp._obj_world_inv = None
+    return True
+
+
+def _sample_full(requests, f0: int, f1: int, scene, hide_other_meshes: bool, isolate: bool) -> dict[str, RigSample]:
+    global last_mode, _probe
+    T = f1 - f0 + 1
+    entries, key = _entries(requests, T)
     done = False
     if isolate and entries and T > 8 and key not in _scene_bound:
         try:
@@ -195,7 +504,7 @@ def sample_objects(requests: list[tuple[object, list[str] | None]], f0: int, f1:
         else:
             _trusted.discard(key)
             _scene_bound.add(key)
-            print(f"MoCap Cleanup: {sorted(seen)} evaluate differently outside their scene; sampling the whole scene")
+            print(f"MoCap Cleanup: {sorted(key)} evaluate differently outside their scene; sampling the whole scene")
     if not done:
         _sample_scene(entries, f0, T, scene, hide_other_meshes=hide_other_meshes)
     last_mode = "isolated" if done else "scene"

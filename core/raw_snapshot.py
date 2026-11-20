@@ -33,6 +33,7 @@ RAW_FLAG_KEY = "mc_is_raw_snapshot"
 BASE_LINK_KEY = "mc_solve_base"
 BASE_FLAG_KEY = "mc_is_solve_base"
 BASE_MISSING_KEY = "mc_missing_paths"
+BASE_VALUES_KEY = "mc_channel_values"
 SOLVED_CRC_KEY = "mc_solved_crc"
 HELPER_FLAGS = (RAW_FLAG_KEY, BASE_FLAG_KEY, "mc_is_residual")
 
@@ -223,12 +224,93 @@ def get_solve_base(obj):
     return base if (base is not None and base.get(BASE_FLAG_KEY)) else None
 
 
+def _channel_values(obj, data_paths) -> dict[str, list[float]]:
+    """What the channels of ``data_paths`` stand at right now (for one without a curve: its value on every frame)."""
+    out = {}
+    for path in data_paths:
+        try:
+            value = obj.path_resolve(path)
+        except ValueError:
+            continue
+        try:
+            out[path] = [float(v) for v in value]
+        except TypeError:
+            try:
+                out[path] = [float(value)]
+            except (TypeError, ValueError):
+                pass
+    return out
+
+
+def _set_channel(obj, data_path: str, index: int, value: float) -> bool:
+    """Set a channel that has no curve to ``value``: a transform channel, or a custom property (``owner["name"]``)."""
+    try:
+        if data_path.endswith('"]'):
+            head, _sep, tail = data_path.rpartition('["')
+            owner, name = obj.path_resolve(head), tail[:-2]
+            cur = owner[name]
+            if hasattr(cur, "__len__"):
+                cur[index] = value
+            else:
+                owner[name] = int(round(value)) if isinstance(cur, int) and not isinstance(cur, bool) else type(cur)(value)
+        else:
+            obj.path_resolve(data_path)[index] = value
+    except (ValueError, TypeError, IndexError, KeyError, AttributeError):
+        return False
+    return True
+
+
+def _json(holder, key: str, default):
+    try:
+        value = json.loads(holder.get(key, ""))
+    except (TypeError, ValueError):
+        return default
+    return value if isinstance(value, type(default)) else default
+
+
+def _held(obj, base, data_paths: list[str]) -> list[str]:
+    """Those of ``data_paths`` that ``base`` holds: as a curve, or noted as having had none.
+
+    A base taken by 1.3.0 or older does not know the FK chain controls (they joined the solve layer later).
+    They are left out for it - not taken for curves the solve made, which a restore would delete."""
+    cb = get_active_channelbag(obj, base)
+    known = {fc.data_path for fc in cb.fcurves} if cb is not None else set()
+    known |= set(_json(base, BASE_MISSING_KEY, []))
+    return [p for p in data_paths if p in known]
+
+
 def solve_is_intact(obj, data_paths: list[str]) -> bool:
     """True when the solver channels still hold exactly what the last solve wrote."""
     act = get_active_action(obj)
-    if act is None or get_solve_base(obj) is None:
+    base = get_solve_base(obj)
+    if act is None or base is None:
         return False
-    return act.get(SOLVED_CRC_KEY, "") == channels_checksum(obj, data_paths)
+    return act.get(SOLVED_CRC_KEY, "") == channels_checksum(obj, _held(obj, base, data_paths))
+
+
+def extend_solve_base(obj, data_paths: list[str]) -> int:
+    """Take those of ``data_paths`` that the base does not hold yet into it, as they are now (see ``_held``).
+    Returns how many were added."""
+    act = get_active_action(obj)
+    base = get_solve_base(obj)
+    if act is None or base is None:
+        return 0
+    new = set(data_paths) - set(_held(obj, base, data_paths))
+    if not new:
+        return 0
+    cb_base = ensure_channelbag(obj, base)
+    cb_cur = get_active_channelbag(obj, act)
+    present = set()
+    if cb_cur is not None:
+        for fc in cb_cur.fcurves:
+            if fc.data_path in new:
+                copy_fcurve_keys(fc, ensure_fcurve(cb_base, fc.data_path, fc.array_index))
+                present.add(fc.data_path)
+    base[BASE_MISSING_KEY] = json.dumps(sorted(set(_json(base, BASE_MISSING_KEY, [])) | (new - present)))
+    values = _json(base, BASE_VALUES_KEY, {})
+    values.update(_channel_values(obj, sorted(new)))
+    base[BASE_VALUES_KEY] = json.dumps(values)
+    return len(new)
 
 
 def store_solve_base(obj, data_paths: list[str]):
@@ -252,6 +334,10 @@ def store_solve_base(obj, data_paths: list[str]):
                 copy_fcurve_keys(fc, ensure_fcurve(cb_base, fc.data_path, fc.array_index))
                 present.add(fc.data_path)
     base[BASE_MISSING_KEY] = json.dumps(sorted(wanted - present))
+    # What the channels without a curve stand at. The solve may give them one (the IK/FK switch of an arm that
+    # is held by a pin, a pole); when that curve goes again the channel has to stand where it stood - left alone
+    # it keeps the value of the frame the playhead is on, and an FK arm stays in IK for the whole take.
+    base[BASE_VALUES_KEY] = json.dumps(_channel_values(obj, sorted(wanted)))
     act[BASE_LINK_KEY] = base.name
     if SOLVED_CRC_KEY in act:
         del act[SOLVED_CRC_KEY]
@@ -266,7 +352,7 @@ def restore_solve_base(obj, data_paths: list[str]) -> bool:
         return False
     cb_cur = ensure_channelbag(obj, act)
     cb_base = get_active_channelbag(obj, base)
-    wanted = set(data_paths)
+    wanted = set(_held(obj, base, data_paths))
     base_keys = set()
     if cb_base is not None:
         for fc in cb_base.fcurves:
@@ -275,16 +361,25 @@ def restore_solve_base(obj, data_paths: list[str]) -> bool:
             base_keys.add((fc.data_path, fc.array_index))
             bone = fcurve_bone_name(fc)
             copy_fcurve_keys(fc, ensure_fcurve(cb_cur, fc.data_path, fc.array_index, group_name=bone))
+    values = _json(base, BASE_VALUES_KEY, {})
+    reset = False
     for fc in list(cb_cur.fcurves):
         if fc.data_path in wanted and (fc.data_path, fc.array_index) not in base_keys:
+            path, index = fc.data_path, fc.array_index
             cb_cur.fcurves.remove(fc)
+            stood = values.get(path)
+            if stood is not None and index < len(stood):
+                reset |= _set_channel(obj, path, index, stood[index])
+    if reset:
+        obj.update_tag()
     return True
 
 
 def mark_solved(obj, data_paths: list[str]) -> None:
     act = get_active_action(obj)
     if act is not None:
-        act[SOLVED_CRC_KEY] = channels_checksum(obj, data_paths)
+        base = get_solve_base(obj)
+        act[SOLVED_CRC_KEY] = channels_checksum(obj, data_paths if base is None else _held(obj, base, data_paths))
 
 
 def drop_solve_base(obj) -> None:
