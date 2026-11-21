@@ -10,7 +10,7 @@ Blender 5.0 or newer (slotted actions). Tested on 5.2 and 5.3. NumPy only, no ex
 
 ## Install
 
-Download `mocap_cleanup-1.3.0.zip` from the [Releases page](https://github.com/MondRubberduck/MoCleanUp/releases/latest), then
+Download `mocap_cleanup-1.3.1.zip` from the [Releases page](https://github.com/MondRubberduck/MoCleanUp/releases/latest), then
 `Edit > Preferences > Get Extensions > ▾ > Install from Disk…` and pick it (or drag it into the Blender window).
 To build the zip yourself: `blender -c extension build --source-dir . --output-dir dist`.
 
@@ -85,8 +85,9 @@ that don't move with the character say nothing about its feet. Choose a mesh as 
 ### Solve
 
 Stages 4 and 5 share one solver. It always starts from the motion as it was before the last solve, so
-moving a pin or changing a setting never stacks corrections. **Remove Solve** takes its result off the
-curves; the pins stay.
+moving a pin or changing a setting never stacks corrections. A pin is keyed on the frames it acts on and
+nowhere else, so an edit only works on those frames again: seconds, also on a take of several minutes.
+**Remove Solve** takes its result off the curves, the FK controls that followed it included; the pins stay.
 
 ### Both chains of a limb
 
@@ -162,7 +163,7 @@ no heel bone: the sole is estimated from the ankle and the toes.
 tests/run.sh "/path/to/blender"
 ```
 
-Eleven headless test files (77 tests) on a generated Rigify human and a plain skeleton baked from it,
+Eleven headless test files (85 tests) on a generated Rigify human and a plain skeleton baked from it,
 plus a static name check. See
 `HANDOFF.md` for the layout of the code and for what a GUI session is needed to verify.
 
